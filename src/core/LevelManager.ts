@@ -47,4 +47,9 @@ export class LevelManager {
     this.levelIndex = 0;
     this.clearedInLevel = 0;
   }
+
+  /** Resets progress within the current level only — used by retry mode on collision. */
+  resetCurrentLevelProgress(): void {
+    this.clearedInLevel = 0;
+  }
 }

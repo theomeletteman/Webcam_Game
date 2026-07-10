@@ -5,8 +5,8 @@ export type ObstacleType = 'jump' | 'duck';
 export class Obstacle {
   x: number;
   private prevX: number;
-  /** Set once this obstacle has scrolled past the player's x position. */
-  cleared = false;
+  /** Resolved once the obstacle has scrolled past the player (cleared) or overlapped it (collided). */
+  outcome: 'pending' | 'cleared' | 'collided' = 'pending';
 
   readonly type: ObstacleType;
   readonly width: number;
