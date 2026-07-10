@@ -1,4 +1,9 @@
 import type { InputSource } from '../input/InputSource';
+import {
+  PLAYER_WIDTH,
+  PLAYER_STANDING_HEIGHT,
+  PLAYER_DUCKING_HEIGHT,
+} from '../core/constants';
 
 export type PlayerState = 'running' | 'jumping' | 'ducking';
 
@@ -14,9 +19,9 @@ export class Player {
 
   state: PlayerState = 'running';
 
-  readonly width = 40;
-  readonly standingHeight = 60;
-  readonly duckingHeight = 30;
+  readonly width = PLAYER_WIDTH;
+  readonly standingHeight = PLAYER_STANDING_HEIGHT;
+  readonly duckingHeight = PLAYER_DUCKING_HEIGHT;
 
   constructor(x: number, initialGroundY: number) {
     this.x = x;
