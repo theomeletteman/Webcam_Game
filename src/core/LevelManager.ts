@@ -33,6 +33,19 @@ export class LevelManager {
       return null;
     }
 
+    return this.completeCurrentLevel();
+  }
+
+  /**
+   * Manually advances past the current level regardless of obstacle count —
+   * used by Score mode, where a level completes on reaching a score target
+   * rather than a clean-clear count.
+   */
+  advanceLevel(): LevelManagerEvent {
+    return this.completeCurrentLevel();
+  }
+
+  private completeCurrentLevel(): LevelManagerEvent {
     const completedLevel = this.levelNumber;
     this.clearedInLevel = 0;
     this.levelIndex++;

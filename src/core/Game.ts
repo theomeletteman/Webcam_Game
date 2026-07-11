@@ -5,8 +5,13 @@ import { KeyboardInput } from '../input/KeyboardInput';
 import type { InputSource } from '../input/InputSource';
 import { ObstacleSpawner } from './ObstacleSpawner';
 import { LevelManager } from './LevelManager';
-import type { LevelConfig } from './LevelConfig';
 import { GROUND_MARGIN, PLAYER_X } from './constants';
+import { WebcamStream } from '../pose/WebcamStream';
+import { PoseDetector } from '../pose/PoseDetector';
+import { PoseCalibrator } from '../pose/PoseCalibrator';
+import { PoseInput } from '../pose/PoseInput';
+import { computeBodyCenterY } from '../pose/bodyMetrics';
+import type { NormalizedLandmark } from '@mediapipe/tasks-vision';
 
 const STATE_COLORS: Record<Player['state'], string> = {
   running: '#89b4fa',
@@ -20,44 +25,44 @@ const OBSTACLE_COLORS = {
 };
 
 const COUNTDOWN_STAGES = ['Ready', 'Set', 'Go!'];
-const COUNTDOWN_STAGE_DURATION = 0.7; // seconds per stage
-const CELEBRATION_DURATION = 1.5; // seconds
-const RETRY_MESSAGE_DURATION = 1.2; // seconds
-const HIT_FLASH_DURATION = 0.2; // seconds
+const COUNTDOWN_STAGE_DURATION = 0.7;
+const CELEBRATION_DURATION = 1.5;
+const RETRY_MESSAGE_DURATION = 1.2;
+const HIT_FLASH_DURATION = 0.2;
 
-// Score mode — its own continuous difficulty ramp, entirely independent of
-// the 5-level structure used by Game Over mode.
 const SCORE_PER_CLEAR = 1;
 const SCORE_PENALTY_PER_COLLISION = 2;
-const WINNING_SCORE = 10;
-const SCORE_MODE_BASE_SPEED = 260;
-const SCORE_MODE_SPEED_RAMP_PER_SEC = 4;
-const SCORE_MODE_MAX_SPEED = 460;
-const SCORE_MODE_MIN_GAP = 300;
-const SCORE_MODE_MAX_GAP = 500;
+const LEVEL_SCORE_TARGET = 10; // Score mode: net points needed to clear each level
 
 type GameMode = 'score' | 'retry';
-type Phase = 'modeSelect' | 'countdown' | 'running' | 'celebrating' | 'levelRetry' | 'setComplete';
+type Phase = 'loadingPose' | 'calibrating' | 'modeSelect' | 'countdown' | 'running' | 'celebrating' | 'levelRetry' | 'setComplete';
 
-interface PendingCelebration {
-  message: string;
-  leadsToSetComplete: boolean;
-}
+type PendingTransition =
+  | { kind: 'celebration'; message: string; leadsToSetComplete: boolean }
+  | { kind: 'retry' };
 
 export class Game {
   private readonly canvas: GameCanvas;
   private readonly loop: GameLoop;
   private readonly player: Player;
-  private readonly input: InputSource;
+  private readonly keyboardInput: KeyboardInput;
   private readonly spawner: ObstacleSpawner;
-  private readonly levelManager: LevelManager; // used only in retry mode
+  private readonly levelManager: LevelManager; // shared level structure for BOTH modes
 
-  private phase: Phase = 'modeSelect';
+  private inputMode: 'pose' | 'keyboard' = 'keyboard';
+  private poseInput: PoseInput | null = null;
+  private poseDetector: PoseDetector | null = null;
+  private webcamStream: WebcamStream | null = null;
+  private calibrator: PoseCalibrator | null = null;
+  private setupMessage = '';
+
+  private phase: Phase = 'loadingPose';
   private mode: GameMode | null = null;
 
-  // Score mode state
-  private score = 0;
-  private scoreModeElapsed = 0;
+  // Score mode: levelScore resets each level (target LEVEL_SCORE_TARGET);
+  // totalScore accumulates across the whole run for the final screen.
+  private levelScore = 0;
+  private totalScore = 0;
 
   private countdownStageIndex = 0;
   private countdownTimer = COUNTDOWN_STAGE_DURATION;
@@ -67,17 +72,16 @@ export class Game {
   private celebrationLeadsToSetComplete = false;
   private finalMessage = '';
 
-  // Set once a level/win threshold is reached, but held until the player
-  // is grounded — avoids freezing mid-jump when the triggering obstacle
-  // is cleared in the air.
-  private pendingCelebration: PendingCelebration | null = null;
+  // Held until the player is grounded, so neither a level-clear nor a
+  // collision ever freezes the player suspended mid-jump.
+  private pendingTransition: PendingTransition | null = null;
 
   private retryTimer = 0;
   private hitFlashTimer = 0;
 
   constructor(container: HTMLElement) {
     this.canvas = new GameCanvas(container);
-    this.input = new KeyboardInput();
+    this.keyboardInput = new KeyboardInput();
     this.player = new Player(PLAYER_X, this.groundY());
     this.levelManager = new LevelManager();
     this.spawner = new ObstacleSpawner(this.levelManager.config.minGapPx);
@@ -102,6 +106,55 @@ export class Game {
     this.loop.start();
   }
 
+  /**
+   * Kicks off webcam + pose model setup in the background. Call once after
+   * construction. Falls back to keyboard input on any failure (denied
+   * permission, unsupported browser, model load failure) rather than
+   * blocking the game from being playable at all.
+   */
+  async initPoseInput(): Promise<void> {
+    try {
+      this.webcamStream = await WebcamStream.start();
+      this.poseDetector = await PoseDetector.create();
+      this.calibrator = new PoseCalibrator();
+      this.poseInput = new PoseInput();
+
+      this.phase = 'calibrating';
+      this.poseDetector.start(this.webcamStream.video, (result, timestampMs) => {
+        this.handlePoseFrame(result.landmarks[0], timestampMs);
+      });
+    } catch {
+      this.setupMessage = 'Camera unavailable — using keyboard controls (Space/↑ jump, ↓/Ctrl duck).';
+      this.phase = 'modeSelect';
+    }
+  }
+
+  private handlePoseFrame(landmarks: NormalizedLandmark[] | undefined, timestampMs: number): void {
+    if (!landmarks) return;
+
+    if (this.phase === 'calibrating' && this.calibrator && !this.calibrator.isComplete) {
+      const bodyY = computeBodyCenterY(landmarks);
+      if (bodyY === null) return;
+
+      this.calibrator.addSample(bodyY, timestampMs);
+      if (this.calibrator.isComplete && this.calibrator.baseline !== null && this.poseInput) {
+        this.poseInput.setBaseline(this.calibrator.baseline);
+        this.inputMode = 'pose';
+        this.setupMessage = 'Move your whole body up to jump, crouch down to duck!';
+        this.phase = 'modeSelect';
+      }
+      return;
+    }
+
+    if (this.inputMode === 'pose' && this.poseInput) {
+      this.poseInput.updateFromLandmarks(landmarks);
+    }
+  }
+
+  private get activeInput(): InputSource {
+    return this.inputMode === 'pose' && this.poseInput ? this.poseInput : this.keyboardInput;
+  }
+
   private groundY(): number {
     return this.canvas.height - GROUND_MARGIN;
   }
@@ -111,7 +164,7 @@ export class Game {
 
     if (event.code === 'Digit1' || event.code === 'Numpad1') {
       this.mode = 'score';
-      this.spawner.reset(SCORE_MODE_MIN_GAP);
+      this.spawner.reset(this.levelManager.config.minGapPx);
       this.beginCountdown();
     } else if (event.code === 'Digit2' || event.code === 'Numpad2') {
       this.mode = 'retry';
@@ -132,6 +185,9 @@ export class Game {
     }
 
     switch (this.phase) {
+      case 'loadingPose':
+      case 'calibrating':
+        break; // driven by handlePoseFrame, not the fixed-timestep loop
       case 'modeSelect':
         break;
       case 'countdown':
@@ -164,17 +220,21 @@ export class Game {
   }
 
   private updateRunning(dt: number): void {
-    this.player.update(dt, this.input, this.groundY());
+    this.player.update(dt, this.activeInput, this.groundY());
 
-    // Hold any earned celebration until the player is grounded, so we
-    // never freeze them mid-jump.
-    if (this.pendingCelebration) {
+    // Physics keeps running (so a jump completes naturally) while we wait
+    // for a safe, grounded moment to actually apply the transition.
+    if (this.pendingTransition) {
       if (this.player.state !== 'jumping') {
-        const pending = this.pendingCelebration;
-        this.pendingCelebration = null;
-        this.startCelebration(pending.message, pending.leadsToSetComplete);
+        const pending = this.pendingTransition;
+        this.pendingTransition = null;
+        if (pending.kind === 'celebration') {
+          this.startCelebration(pending.message, pending.leadsToSetComplete);
+        } else {
+          this.startRetryTransition();
+        }
       }
-      return;
+      return; // obstacles frozen during the brief hand-off
     }
 
     if (this.mode === 'score') {
@@ -184,37 +244,37 @@ export class Game {
     }
   }
 
-  private currentScoreModeConfig(): LevelConfig {
-    const scrollSpeed = Math.min(
-      SCORE_MODE_MAX_SPEED,
-      SCORE_MODE_BASE_SPEED + this.scoreModeElapsed * SCORE_MODE_SPEED_RAMP_PER_SEC,
-    );
-    return {
-      level: 0, // unused — score mode has no level HUD
-      scrollSpeed,
-      minGapPx: SCORE_MODE_MIN_GAP,
-      maxGapPx: SCORE_MODE_MAX_GAP,
-      obstacleTypes: ['jump', 'duck'],
-      obstaclesToClear: 0, // unused — score mode never consults LevelManager
-    };
-  }
-
   private updateScoreMode(dt: number): void {
-    this.scoreModeElapsed += dt;
-    const config = this.currentScoreModeConfig();
+    const config = this.levelManager.config;
     const result = this.spawner.update(dt, config, this.groundY(), this.canvas.width, this.player);
 
     if (result.collidedCount > 0) {
       this.hitFlashTimer = HIT_FLASH_DURATION;
-      this.score = Math.max(0, this.score - result.collidedCount * SCORE_PENALTY_PER_COLLISION);
+      const penalty = result.collidedCount * SCORE_PENALTY_PER_COLLISION;
+      this.levelScore = Math.max(0, this.levelScore - penalty);
+      this.totalScore = Math.max(0, this.totalScore - penalty);
     }
-    this.score += result.clearedCount * SCORE_PER_CLEAR;
 
-    if (this.score >= WINNING_SCORE) {
-      this.pendingCelebration = {
-        message: `You reached the winning score of ${WINNING_SCORE}!`,
-        leadsToSetComplete: true,
-      };
+    const gain = result.clearedCount * SCORE_PER_CLEAR;
+    this.levelScore += gain;
+    this.totalScore += gain;
+
+    if (this.levelScore >= LEVEL_SCORE_TARGET) {
+      this.levelScore = 0;
+      const event = this.levelManager.advanceLevel();
+      if (event.type === 'levelComplete') {
+        this.pendingTransition = {
+          kind: 'celebration',
+          message: `Level ${event.completedLevel} complete!`,
+          leadsToSetComplete: false,
+        };
+      } else {
+        this.pendingTransition = {
+          kind: 'celebration',
+          message: 'All levels complete!',
+          leadsToSetComplete: true,
+        };
+      }
     }
   }
 
@@ -224,15 +284,15 @@ export class Game {
 
     if (result.collidedCount > 0) {
       this.hitFlashTimer = HIT_FLASH_DURATION;
-      this.startRetryTransition();
+      this.pendingTransition = { kind: 'retry' };
       return;
     }
 
     const event = this.levelManager.registerCleared(result.clearedCount);
     if (event?.type === 'levelComplete') {
-      this.pendingCelebration = { message: `Level ${event.completedLevel} complete!`, leadsToSetComplete: false };
+      this.pendingTransition = { kind: 'celebration', message: `Level ${event.completedLevel} complete!`, leadsToSetComplete: false };
     } else if (event?.type === 'setComplete') {
-      this.pendingCelebration = { message: 'All levels complete!', leadsToSetComplete: true };
+      this.pendingTransition = { kind: 'celebration', message: 'All levels complete!', leadsToSetComplete: true };
     }
   }
 
@@ -277,6 +337,16 @@ export class Game {
     this.canvas.clear();
     const ctx = this.canvas.ctx;
 
+    if (this.phase === 'loadingPose') {
+      this.renderLoadingPose(ctx);
+      return;
+    }
+
+    if (this.phase === 'calibrating') {
+      this.renderCalibrating(ctx);
+      return;
+    }
+
     if (this.phase === 'modeSelect') {
       this.renderModeSelect(ctx);
       return;
@@ -302,6 +372,45 @@ export class Game {
     this.renderHud(ctx);
   }
 
+  private renderLoadingPose(ctx: CanvasRenderingContext2D): void {
+    ctx.fillStyle = '#1e1e2e';
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#f5f5f5';
+    ctx.font = '20px sans-serif';
+    ctx.fillText('Requesting camera access...', this.canvas.width / 2, this.canvas.height / 2);
+  }
+
+  private renderCalibrating(ctx: CanvasRenderingContext2D): void {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+    // Mirrored video preview so the player sees themselves like a mirror.
+    if (this.webcamStream) {
+      ctx.save();
+      ctx.scale(-1, 1);
+      ctx.drawImage(this.webcamStream.video, -this.canvas.width, 0, this.canvas.width, this.canvas.height);
+      ctx.restore();
+    }
+
+    const progress = this.calibrator ? this.calibrator.progress(performance.now()) : 0;
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#f5f5f5';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('Stand naturally, arms visible...', this.canvas.width / 2, 40);
+    ctx.font = '16px sans-serif';
+    ctx.fillText(`Calibrating: ${Math.round(progress * 100)}%`, this.canvas.width / 2, 68);
+
+    const barWidth = 240;
+    const barX = this.canvas.width / 2 - barWidth / 2;
+    ctx.fillStyle = '#3a3a4a';
+    ctx.fillRect(barX, 84, barWidth, 8);
+    ctx.fillStyle = '#a6e3a1';
+    ctx.fillRect(barX, 84, barWidth * progress, 8);
+  }
+
   private renderModeSelect(ctx: CanvasRenderingContext2D): void {
     ctx.fillStyle = '#1e1e2e';
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
@@ -314,31 +423,38 @@ export class Game {
     ctx.font = '18px sans-serif';
     ctx.fillStyle = '#89b4fa';
     ctx.fillText(
-      `[1]  Score mode — reach ${WINNING_SCORE} points to win (clear +${SCORE_PER_CLEAR}, hit -${SCORE_PENALTY_PER_COLLISION})`,
+      `[1]  Score mode — reach ${LEVEL_SCORE_TARGET} points to clear each level (+${SCORE_PER_CLEAR} clear, -${SCORE_PENALTY_PER_COLLISION} hit)`,
       this.canvas.width / 2,
       this.canvas.height / 2,
     );
     ctx.fillStyle = '#f38ba8';
     ctx.fillText(
-      '[2]  Game Over mode — clear all obstacles per level; a collision means redoing the level',
+      '[2]  Game Over mode — clear every obstacle; a single hit means redoing the level',
       this.canvas.width / 2,
       this.canvas.height / 2 + 32,
     );
+
+    if (this.setupMessage) {
+      ctx.fillStyle = '#cba6f7';
+      ctx.font = '14px sans-serif';
+      ctx.fillText(this.setupMessage, this.canvas.width / 2, this.canvas.height / 2 + 68);
+    }
   }
 
   private renderHud(ctx: CanvasRenderingContext2D): void {
     ctx.fillStyle = '#f5f5f5';
     ctx.font = '16px sans-serif';
 
-    if (this.mode === 'retry' && !this.levelManager.isSetComplete) {
+    if (!this.levelManager.isSetComplete) {
       ctx.textAlign = 'left';
-      const { cleared, needed } = this.levelManager.progress;
-      ctx.fillText(`Level ${this.levelManager.levelNumber} — ${cleared}/${needed}`, 16, 28);
-    }
-
-    if (this.mode === 'score') {
-      ctx.textAlign = 'right';
-      ctx.fillText(`Score: ${this.score} / ${WINNING_SCORE}`, this.canvas.width - 16, 28);
+      if (this.mode === 'score') {
+        ctx.fillText(`Level ${this.levelManager.levelNumber} — Score: ${this.levelScore}/${LEVEL_SCORE_TARGET}`, 16, 28);
+        ctx.textAlign = 'right';
+        ctx.fillText(`Total: ${this.totalScore}`, this.canvas.width - 16, 28);
+      } else {
+        const { cleared, needed } = this.levelManager.progress;
+        ctx.fillText(`Level ${this.levelManager.levelNumber} — ${cleared}/${needed}`, 16, 28);
+      }
     }
 
     ctx.textAlign = 'center';
@@ -358,7 +474,7 @@ export class Game {
     } else if (this.phase === 'setComplete') {
       ctx.font = 'bold 28px sans-serif';
       ctx.fillStyle = '#a6e3a1';
-      const text = this.mode === 'score' ? `${this.finalMessage} Final score: ${this.score}` : this.finalMessage;
+      const text = this.mode === 'score' ? `${this.finalMessage} Final score: ${this.totalScore}` : this.finalMessage;
       ctx.fillText(text, this.canvas.width / 2, this.canvas.height / 2);
     }
   }
