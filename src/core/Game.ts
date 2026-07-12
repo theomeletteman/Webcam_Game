@@ -12,7 +12,7 @@ import { PoseCalibrator } from '../pose/PoseCalibrator';
 import { PoseInput } from '../pose/PoseInput';
 import { computeBodyCenterY } from '../pose/bodyMetrics';
 import { countRaisedHands } from '../pose/handGesture';
-import { drawSky, drawSkyline, drawGround, drawPlayer, drawObstacle, drawOfficeBuilding, OFFICE_WIDTH } from '../render/draw';
+import { drawSky, drawSkyline, drawGround, drawPlayer, drawObstacle, drawOfficeBuilding, OFFICE_WIDTH, drawTrophyIcon, drawWarningIcon } from '../render/draw';
 import type { PlayerAvatar } from '../entities/Player';
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision';
 
@@ -23,9 +23,10 @@ const RETRY_MESSAGE_DURATION = 1.2;
 const HIT_FLASH_DURATION = 0.2;
 
 const SCORE_PER_CLEAR = 1;
-const SCORE_PENALTY_PER_COLLISION = 2;
+const SCORE_PENALTY_PER_COLLISION = 1;
 const LEVEL_SCORE_TARGET = 10;
-const HAND_GESTURE_CONFIRM_MS = 350; // Score mode: net points needed to clear each level
+const HAND_GESTURE_CONFIRM_MS = 350;
+const MENU_BACKGROUND_SCROLL_SPEED = 90; // keeps selection-screen backdrops alive // Score mode: net points needed to clear each level
 
 type GameMode = 'score' | 'retry';
 type Phase =
@@ -255,7 +256,9 @@ export class Game {
       case 'loadingPose':
       case 'calibrating':
         break; // driven by handlePoseFrame, not the fixed-timestep loop
+      case 'avatarSelect':
       case 'modeSelect':
+        this.worldDistance += MENU_BACKGROUND_SCROLL_SPEED * dt; // keeps the backdrop and idle dog alive
         break;
       case 'countdown':
         this.updateCountdown(dt);
@@ -528,75 +531,150 @@ export class Game {
     ctx.fillRect(barX, 84, barWidth * progress, 8);
   }
 
+  private drawPanel(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, borderColor: string, bobOffset: number): number {
+    const bob = Math.sin(this.worldDistance * 0.03 + bobOffset) * 4;
+    const panelY = y + bob;
+    ctx.fillStyle = 'rgba(20, 20, 36, 0.72)';
+    ctx.strokeStyle = borderColor;
+    ctx.lineWidth = 2;
+    const r = 10;
+    ctx.beginPath();
+    ctx.moveTo(x + r, panelY);
+    ctx.arcTo(x + w, panelY, x + w, panelY + h, r);
+    ctx.arcTo(x + w, panelY + h, x, panelY + h, r);
+    ctx.arcTo(x, panelY + h, x, panelY, r);
+    ctx.arcTo(x, panelY, x + w, panelY, r);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    return panelY;
+  }
+
+  private renderSelectSceneBackground(ctx: CanvasRenderingContext2D): void {
+    const groundY = this.groundY();
+    drawSky(ctx, this.canvas.width, this.canvas.height);
+    drawSkyline(ctx, this.canvas.width, groundY, this.worldDistance);
+    drawGround(ctx, this.canvas.width, groundY, this.worldDistance);
+  }
+
   private renderAvatarSelect(ctx: CanvasRenderingContext2D): void {
-    ctx.fillStyle = '#1e1e2e';
-    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    this.renderSelectSceneBackground(ctx);
+    const groundY = this.groundY();
 
     ctx.textAlign = 'center';
     ctx.fillStyle = '#f5f5f5';
     ctx.font = 'bold 26px sans-serif';
-    ctx.fillText('Choose your dog', this.canvas.width / 2, 50);
+    ctx.fillText('Choose your dog', this.canvas.width / 2, 44);
 
-    const previewY = this.canvas.height / 2 - 40;
-    const leftX = this.canvas.width / 2 - 90;
-    const rightX = this.canvas.width / 2 + 50;
+    const cardW = 130;
+    const cardH = 150;
+    const leftX = this.canvas.width / 2 - cardW - 10;
+    const rightX = this.canvas.width / 2 + 10;
+    const cardTop = 64;
 
-    drawPlayer(ctx, leftX, previewY, 40, 60, 'running', 'male', this.worldDistance, null);
-    drawPlayer(ctx, rightX, previewY, 40, 60, 'running', 'female', this.worldDistance, null);
+    const leftPanelY = this.drawPanel(ctx, leftX, cardTop, cardW, cardH, '#89b4fa', 0);
+    const rightPanelY = this.drawPanel(ctx, rightX, cardTop, cardW, cardH, '#f38ba8', Math.PI);
 
-    ctx.font = '15px sans-serif';
+    drawPlayer(ctx, leftX + cardW / 2 - 20, leftPanelY + 18, 40, 62, 'running', 'male', this.worldDistance, null);
+    drawPlayer(ctx, rightX + cardW / 2 - 20, rightPanelY + 18, 40, 62, 'running', 'female', this.worldDistance, null);
+
+    ctx.font = 'bold 14px sans-serif';
     ctx.fillStyle = '#89b4fa';
-    ctx.fillText(
-      this.inputMode === 'pose' ? '[Raise 1 hand]' : '[1]',
-      leftX + 20,
-      previewY + 90,
-    );
+    ctx.fillText(this.inputMode === 'pose' ? '[Raise 1 hand]' : '[1]', leftX + cardW / 2, leftPanelY + 118);
+    ctx.fillText('Male', leftX + cardW / 2, leftPanelY + 136);
     ctx.fillStyle = '#f38ba8';
-    ctx.fillText(
-      this.inputMode === 'pose' ? '[Raise 2 hands]' : '[2]',
-      rightX + 20,
-      previewY + 90,
-    );
+    ctx.fillText(this.inputMode === 'pose' ? '[Raise 2 hands]' : '[2]', rightX + cardW / 2, rightPanelY + 118);
+    ctx.fillText('Female', rightX + cardW / 2, rightPanelY + 136);
+
+    // A little idle audience of office workers already going about their commute below the cards.
+    const idleDogY = groundY - 46;
+    drawPlayer(ctx, this.canvas.width / 2 - 20, idleDogY, 40, 46, 'running', 'male', this.worldDistance * 0.6, null);
 
     if (this.setupMessage) {
       ctx.fillStyle = '#cba6f7';
       ctx.font = '14px sans-serif';
-      ctx.fillText(this.setupMessage, this.canvas.width / 2, previewY + 120);
+      ctx.fillText(this.setupMessage, this.canvas.width / 2, cardTop + cardH + 34);
     }
   }
 
   private renderModeSelect(ctx: CanvasRenderingContext2D): void {
-    ctx.fillStyle = '#1e1e2e';
-    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    this.renderSelectSceneBackground(ctx);
+    const groundY = this.groundY();
 
     ctx.textAlign = 'center';
     ctx.fillStyle = '#f5f5f5';
     ctx.font = 'bold 26px sans-serif';
-    ctx.fillText('Choose a game mode', this.canvas.width / 2, this.canvas.height / 2 - 50);
+    ctx.fillText('Choose a game mode', this.canvas.width / 2, 40);
 
-    ctx.font = '18px sans-serif';
+    const cardW = Math.min(280, this.canvas.width / 2 - 24);
+    const cardH = 130;
+    const leftX = this.canvas.width / 2 - cardW - 10;
+    const rightX = this.canvas.width / 2 + 10;
+    const cardTop = 60;
+
+    const leftPanelY = this.drawPanel(ctx, leftX, cardTop, cardW, cardH, '#89b4fa', 0);
+    const rightPanelY = this.drawPanel(ctx, rightX, cardTop, cardW, cardH, '#f38ba8', Math.PI);
+
+    drawTrophyIcon(ctx, leftX + 34, leftPanelY + 40, 32);
+    drawWarningIcon(ctx, rightX + 34, rightPanelY + 40, 32);
+
+    ctx.textAlign = 'left';
+    ctx.font = 'bold 16px sans-serif';
     ctx.fillStyle = '#89b4fa';
-    ctx.fillText(
-      this.inputMode === 'pose'
-        ? `[Raise 1 hand]  Score mode — reach ${LEVEL_SCORE_TARGET} points to clear each level (+${SCORE_PER_CLEAR} clear, -${SCORE_PENALTY_PER_COLLISION} hit)`
-        : `[1]  Score mode — reach ${LEVEL_SCORE_TARGET} points to clear each level (+${SCORE_PER_CLEAR} clear, -${SCORE_PENALTY_PER_COLLISION} hit)`,
-      this.canvas.width / 2,
-      this.canvas.height / 2,
+    ctx.fillText(this.inputMode === 'pose' ? '[Raise 1 hand]' : '[1]', leftX + 58, leftPanelY + 30);
+    ctx.fillText('Score mode', leftX + 58, leftPanelY + 50);
+    ctx.font = '13px sans-serif';
+    ctx.fillStyle = '#cdd6f4';
+    this.wrapText(
+      ctx,
+      `Reach ${LEVEL_SCORE_TARGET} points to clear each level (+${SCORE_PER_CLEAR} clear, -${SCORE_PENALTY_PER_COLLISION} hit)`,
+      leftX + 14,
+      leftPanelY + 74,
+      cardW - 28,
+      16,
     );
+
+    ctx.font = 'bold 16px sans-serif';
     ctx.fillStyle = '#f38ba8';
-    ctx.fillText(
-      this.inputMode === 'pose'
-        ? '[Raise 2 hands]  Game Over mode — clear every obstacle; a single hit means redoing the level'
-        : '[2]  Game Over mode — clear every obstacle; a single hit means redoing the level',
-      this.canvas.width / 2,
-      this.canvas.height / 2 + 32,
+    ctx.fillText(this.inputMode === 'pose' ? '[Raise 2 hands]' : '[2]', rightX + 58, rightPanelY + 30);
+    ctx.fillText('Game Over mode', rightX + 58, rightPanelY + 50);
+    ctx.font = '13px sans-serif';
+    ctx.fillStyle = '#cdd6f4';
+    this.wrapText(
+      ctx,
+      'Clear every obstacle — a single hit means redoing the level from scratch',
+      rightX + 14,
+      rightPanelY + 74,
+      cardW - 28,
+      16,
     );
+
+    const idleDogY = groundY - 46;
+    ctx.textAlign = 'center';
+    drawPlayer(ctx, this.canvas.width / 2 - 20, idleDogY, 40, 46, 'running', this.player.avatar, this.worldDistance, null);
 
     if (this.setupMessage) {
       ctx.fillStyle = '#cba6f7';
-      ctx.font = '14px sans-serif';
-      ctx.fillText(this.setupMessage, this.canvas.width / 2, this.canvas.height / 2 + 68);
+      ctx.font = '13px sans-serif';
+      ctx.fillText(this.setupMessage, this.canvas.width / 2, cardTop + cardH + 24);
     }
+  }
+
+  private wrapText(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, maxWidth: number, lineHeight: number): void {
+    const words = text.split(' ');
+    let line = '';
+    let lineY = y;
+    for (const word of words) {
+      const testLine = line ? `${line} ${word}` : word;
+      if (ctx.measureText(testLine).width > maxWidth && line) {
+        ctx.fillText(line, x, lineY);
+        line = word;
+        lineY += lineHeight;
+      } else {
+        line = testLine;
+      }
+    }
+    ctx.fillText(line, x, lineY);
   }
 
   private renderHud(ctx: CanvasRenderingContext2D): void {
