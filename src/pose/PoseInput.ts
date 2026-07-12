@@ -27,9 +27,13 @@ const JUMP_CONFIRM_MS = 60;
 const JUMP_COOLDOWN_MS = 600;
 
 // Standing up quickly from a duck often overshoots slightly above the
-// normal standing baseline (a small rebound), which would otherwise
-// misfire as a jump.
-const DUCK_RELEASE_JUMP_COOLDOWN_MS = 400;
+// normal standing baseline (a small rebound). Rather than blocking jump
+// detection outright for a window after duck release (which would also
+// block a genuine, deliberate duck-then-jump combo), we raise the bar:
+// a jump during this window must clear a noticeably bigger threshold,
+// which a passive rebound won't reach but a real jump attempt will.
+const DUCK_RELEASE_COOLDOWN_MS = 400;
+const DUCK_RELEASE_JUMP_MULTIPLIER = 1.6;
 
 export class PoseInput implements InputSource {
   private baselineY: number | null = null;
@@ -83,7 +87,11 @@ export class PoseInput implements InputSource {
   private updatePoseState(y: number, timestampMs: number): void {
     const baseline = this.baselineY!;
     const rawDuckCandidate = y - baseline > this.duckDelta;
-    const rawJumpCandidate = baseline - y > this.jumpDelta;
+
+    const inDuckReleaseCooldown =
+      this.duckReleasedAtMs !== null && timestampMs - this.duckReleasedAtMs < DUCK_RELEASE_COOLDOWN_MS;
+    const effectiveJumpDelta = inDuckReleaseCooldown ? this.jumpDelta * DUCK_RELEASE_JUMP_MULTIPLIER : this.jumpDelta;
+    const rawJumpCandidate = baseline - y > effectiveJumpDelta;
 
     // If the body is currently moving upward past the jump threshold,
     // don't let a not-yet-confirmed duck reading lock in — that's the
@@ -99,7 +107,7 @@ export class PoseInput implements InputSource {
     const duckElapsed = this.duckCandidateSinceMs === null ? 0 : timestampMs - this.duckCandidateSinceMs;
     if (duckElapsed >= DUCK_CONFIRM_MS && this.duckHeld !== this.duckCandidate) {
       if (this.duckHeld && !this.duckCandidate) {
-        this.duckReleasedAtMs = timestampMs; // just released — arm the jump cooldown
+        this.duckReleasedAtMs = timestampMs; // just released — arms the raised-threshold window
       }
       this.duckHeld = this.duckCandidate;
     }
@@ -116,12 +124,10 @@ export class PoseInput implements InputSource {
     this.confirmedAboveJump = this.aboveJumpCandidate;
     if (wasConfirmedAbove || !this.confirmedAboveJump) return; // only act on a rising edge
 
-    const inDuckCooldown =
-      this.duckReleasedAtMs !== null && timestampMs - this.duckReleasedAtMs < DUCK_RELEASE_JUMP_COOLDOWN_MS;
     const inJumpCooldown =
       this.lastJumpQueuedAtMs !== null && timestampMs - this.lastJumpQueuedAtMs < JUMP_COOLDOWN_MS;
 
-    if (!inDuckCooldown && !inJumpCooldown && !this.duckHeld) {
+    if (!inJumpCooldown && !this.duckHeld) {
       this.jumpQueued = true;
       this.lastJumpQueuedAtMs = timestampMs;
     }

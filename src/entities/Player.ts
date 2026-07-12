@@ -6,6 +6,7 @@ import {
 } from '../core/constants';
 
 export type PlayerState = 'running' | 'jumping' | 'ducking';
+export type PlayerAvatar = 'male' | 'female';
 
 const GRAVITY = 1800; // px/s^2
 const JUMP_VELOCITY = -700; // px/s (negative = upward)
@@ -18,6 +19,8 @@ export class Player {
   private grounded = true;
 
   state: PlayerState = 'running';
+  /** Purely cosmetic — doesn't affect physics or hitbox. */
+  avatar: PlayerAvatar = 'male';
 
   readonly width = PLAYER_WIDTH;
   readonly standingHeight = PLAYER_STANDING_HEIGHT;

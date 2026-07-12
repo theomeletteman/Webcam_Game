@@ -12,7 +12,8 @@ import { PoseCalibrator } from '../pose/PoseCalibrator';
 import { PoseInput } from '../pose/PoseInput';
 import { computeBodyCenterY } from '../pose/bodyMetrics';
 import { countRaisedHands } from '../pose/handGesture';
-import { drawSky, drawHills, drawGround, drawPlayer, drawObstacle } from '../render/draw';
+import { drawSky, drawSkyline, drawGround, drawPlayer, drawObstacle, drawOfficeBuilding, OFFICE_WIDTH } from '../render/draw';
+import type { PlayerAvatar } from '../entities/Player';
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision';
 
 const COUNTDOWN_STAGES = ['Ready', 'Set', 'Go!'];
@@ -27,7 +28,16 @@ const LEVEL_SCORE_TARGET = 10;
 const HAND_GESTURE_CONFIRM_MS = 350; // Score mode: net points needed to clear each level
 
 type GameMode = 'score' | 'retry';
-type Phase = 'loadingPose' | 'calibrating' | 'modeSelect' | 'countdown' | 'running' | 'celebrating' | 'levelRetry' | 'setComplete';
+type Phase =
+  | 'loadingPose'
+  | 'calibrating'
+  | 'avatarSelect'
+  | 'modeSelect'
+  | 'countdown'
+  | 'running'
+  | 'celebrating'
+  | 'levelRetry'
+  | 'setComplete';
 
 type PendingTransition =
   | { kind: 'celebration'; message: string; leadsToSetComplete: boolean }
@@ -76,6 +86,14 @@ export class Game {
   private hitFlashTimer = 0;
   private worldDistance = 0; // accumulated scroll distance, drives parallax + running-leg animation
 
+  // Level completion is visualized as reaching an office building rather
+  // than an instant freeze. Once a level's threshold is hit, the building
+  // spawns and scrolls in; only once the player actually reaches it do we
+  // fall through to the existing pendingTransition (wait-for-landing then
+  // celebrate) flow.
+  private finishBuildingX: number | null = null;
+  private pendingFinishCelebration: { message: string; leadsToSetComplete: boolean } | null = null;
+
   constructor(container: HTMLElement) {
     this.canvas = new GameCanvas(container);
     this.keyboardInput = new KeyboardInput();
@@ -122,7 +140,7 @@ export class Game {
       });
     } catch {
       this.setupMessage = 'Camera unavailable — using keyboard controls (Space/↑ jump, ↓/Ctrl duck).';
-      this.phase = 'modeSelect';
+      this.phase = 'avatarSelect';
     }
   }
 
@@ -137,8 +155,8 @@ export class Game {
       if (this.calibrator.isComplete && this.calibrator.baseline !== null && this.poseInput) {
         this.poseInput.setBaseline(this.calibrator.baseline);
         this.inputMode = 'pose';
-        this.setupMessage = 'Raise one hand for Score mode, both hands for Game Over mode';
-        this.phase = 'modeSelect';
+        this.setupMessage = 'Raise one hand for the male dog, both hands for the female dog';
+        this.phase = 'avatarSelect';
       }
       return;
     }
@@ -146,19 +164,29 @@ export class Game {
     if (this.inputMode === 'pose' && this.poseInput) {
       this.poseInput.updateFromLandmarks(landmarks, timestampMs);
 
-      // Mode selection by hand-raise gesture — deliberately separate from
-      // jump/duck (rather than reusing them) so the player doesn't need to
-      // walk back to the laptop after calibration, and so gameplay gestures
-      // stay reserved for gameplay. One hand raised = Score, both = Game
-      // Over. Debounced the same way duck is, so a hand passing briefly
-      // through the raised zone doesn't cause an accidental selection.
-      if (this.phase === 'modeSelect') {
-        this.updateModeSelectGesture(landmarks, timestampMs);
+      // Both avatar and mode selection use the same debounced hand-raise
+      // gesture pattern (1 hand vs 2 hands) — deliberately separate from
+      // jump/duck so the player doesn't need to walk back to the laptop,
+      // and so gameplay gestures stay reserved for gameplay.
+      if (this.phase === 'avatarSelect') {
+        this.updateHandRaiseGesture(landmarks, timestampMs, (count) => {
+          if (count === 1) this.selectAvatar('male');
+          else if (count === 2) this.selectAvatar('female');
+        });
+      } else if (this.phase === 'modeSelect') {
+        this.updateHandRaiseGesture(landmarks, timestampMs, (count) => {
+          if (count === 1) this.selectMode('score');
+          else if (count === 2) this.selectMode('retry');
+        });
       }
     }
   }
 
-  private updateModeSelectGesture(landmarks: NormalizedLandmark[], timestampMs: number): void {
+  private updateHandRaiseGesture(
+    landmarks: NormalizedLandmark[],
+    timestampMs: number,
+    onConfirmed: (raisedCount: number) => void,
+  ): void {
     const raisedCount = countRaisedHands(landmarks);
 
     if (raisedCount !== this.handRaiseCandidateCount) {
@@ -168,12 +196,9 @@ export class Game {
 
     const elapsed = this.handRaiseCandidateSinceMs === null ? 0 : timestampMs - this.handRaiseCandidateSinceMs;
     if (elapsed < HAND_GESTURE_CONFIRM_MS) return;
+    if (raisedCount === 0) return;
 
-    if (raisedCount === 1) {
-      this.selectMode('score');
-    } else if (raisedCount === 2) {
-      this.selectMode('retry');
-    }
+    onConfirmed(raisedCount);
   }
 
   private get activeInput(): InputSource {
@@ -185,14 +210,29 @@ export class Game {
   }
 
   private readonly handleModeSelectKey = (event: KeyboardEvent): void => {
-    if (this.phase !== 'modeSelect') return;
+    const isOne = event.code === 'Digit1' || event.code === 'Numpad1';
+    const isTwo = event.code === 'Digit2' || event.code === 'Numpad2';
+    if (!isOne && !isTwo) return;
 
-    if (event.code === 'Digit1' || event.code === 'Numpad1') {
-      this.selectMode('score');
-    } else if (event.code === 'Digit2' || event.code === 'Numpad2') {
-      this.selectMode('retry');
+    if (this.phase === 'avatarSelect') {
+      this.selectAvatar(isOne ? 'male' : 'female');
+    } else if (this.phase === 'modeSelect') {
+      this.selectMode(isOne ? 'score' : 'retry');
     }
   };
+
+  private selectAvatar(avatar: PlayerAvatar): void {
+    this.player.avatar = avatar;
+    // Reset gesture debounce so a stale confirmed hand-count doesn't
+    // immediately re-trigger a selection on the next screen.
+    this.handRaiseCandidateCount = null;
+    this.handRaiseCandidateSinceMs = null;
+    this.setupMessage =
+      this.inputMode === 'pose'
+        ? 'Raise one hand for Score mode, both hands for Game Over mode'
+        : '';
+    this.phase = 'modeSelect';
+  }
 
   private selectMode(mode: GameMode): void {
     this.mode = mode;
@@ -264,10 +304,36 @@ export class Game {
       return; // obstacles frozen during the brief hand-off
     }
 
+    if (this.finishBuildingX !== null) {
+      this.updateFinishApproach(dt);
+      return;
+    }
+
     if (this.mode === 'score') {
       this.updateScoreMode(dt);
     } else {
       this.updateRetryMode(dt);
+    }
+  }
+
+  /** Level threshold reached: stop spawning hazards and let the office building scroll in as the visual finish line. */
+  private startFinishApproach(message: string, leadsToSetComplete: boolean): void {
+    this.finishBuildingX = this.canvas.width + OFFICE_WIDTH;
+    this.pendingFinishCelebration = { message, leadsToSetComplete };
+  }
+
+  private updateFinishApproach(dt: number): void {
+    const scrollSpeed = this.levelManager.config.scrollSpeed;
+    this.worldDistance += scrollSpeed * dt;
+    this.finishBuildingX! -= scrollSpeed * dt;
+
+    if (this.finishBuildingX! <= this.player.x + this.player.width) {
+      const pending = this.pendingFinishCelebration!;
+      this.finishBuildingX = null;
+      this.pendingFinishCelebration = null;
+      // Hands off to the existing wait-for-landing mechanism, so reaching
+      // the building mid-jump still lands cleanly before celebrating.
+      this.pendingTransition = { kind: 'celebration', message: pending.message, leadsToSetComplete: pending.leadsToSetComplete };
     }
   }
 
@@ -291,17 +357,9 @@ export class Game {
       this.levelScore = 0;
       const event = this.levelManager.advanceLevel();
       if (event.type === 'levelComplete') {
-        this.pendingTransition = {
-          kind: 'celebration',
-          message: `Level ${event.completedLevel} complete!`,
-          leadsToSetComplete: false,
-        };
+        this.startFinishApproach(`Level ${event.completedLevel} complete!`, false);
       } else {
-        this.pendingTransition = {
-          kind: 'celebration',
-          message: 'All levels complete!',
-          leadsToSetComplete: true,
-        };
+        this.startFinishApproach('All levels complete!', true);
       }
     }
   }
@@ -319,9 +377,9 @@ export class Game {
 
     const event = this.levelManager.registerCleared(result.clearedCount);
     if (event?.type === 'levelComplete') {
-      this.pendingTransition = { kind: 'celebration', message: `Level ${event.completedLevel} complete!`, leadsToSetComplete: false };
+      this.startFinishApproach(`Level ${event.completedLevel} complete!`, false);
     } else if (event?.type === 'setComplete') {
-      this.pendingTransition = { kind: 'celebration', message: 'All levels complete!', leadsToSetComplete: true };
+      this.startFinishApproach('All levels complete!', true);
     }
   }
 
@@ -376,6 +434,11 @@ export class Game {
       return;
     }
 
+    if (this.phase === 'avatarSelect') {
+      this.renderAvatarSelect(ctx);
+      return;
+    }
+
     if (this.phase === 'modeSelect') {
       this.renderModeSelect(ctx);
       return;
@@ -384,11 +447,15 @@ export class Game {
     const groundY = this.groundY();
 
     drawSky(ctx, this.canvas.width, this.canvas.height);
-    drawHills(ctx, this.canvas.width, groundY, this.worldDistance);
+    drawSkyline(ctx, this.canvas.width, groundY, this.worldDistance);
     drawGround(ctx, this.canvas.width, groundY, this.worldDistance);
 
     for (const obstacle of this.spawner.all) {
       drawObstacle(ctx, obstacle.interpolatedX(alpha), obstacle.y, obstacle.width, obstacle.height, obstacle.type);
+    }
+
+    if (this.finishBuildingX !== null) {
+      drawOfficeBuilding(ctx, this.finishBuildingX, groundY);
     }
 
     const playerY = this.player.interpolatedY(alpha);
@@ -399,6 +466,7 @@ export class Game {
       this.player.width,
       this.player.height,
       this.player.state,
+      this.player.avatar,
       this.worldDistance,
       this.hitFlashTimer > 0 ? '#f38ba8' : null,
     );
@@ -460,6 +528,43 @@ export class Game {
     ctx.fillRect(barX, 84, barWidth * progress, 8);
   }
 
+  private renderAvatarSelect(ctx: CanvasRenderingContext2D): void {
+    ctx.fillStyle = '#1e1e2e';
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#f5f5f5';
+    ctx.font = 'bold 26px sans-serif';
+    ctx.fillText('Choose your dog', this.canvas.width / 2, 50);
+
+    const previewY = this.canvas.height / 2 - 40;
+    const leftX = this.canvas.width / 2 - 90;
+    const rightX = this.canvas.width / 2 + 50;
+
+    drawPlayer(ctx, leftX, previewY, 40, 60, 'running', 'male', this.worldDistance, null);
+    drawPlayer(ctx, rightX, previewY, 40, 60, 'running', 'female', this.worldDistance, null);
+
+    ctx.font = '15px sans-serif';
+    ctx.fillStyle = '#89b4fa';
+    ctx.fillText(
+      this.inputMode === 'pose' ? '[Raise 1 hand]' : '[1]',
+      leftX + 20,
+      previewY + 90,
+    );
+    ctx.fillStyle = '#f38ba8';
+    ctx.fillText(
+      this.inputMode === 'pose' ? '[Raise 2 hands]' : '[2]',
+      rightX + 20,
+      previewY + 90,
+    );
+
+    if (this.setupMessage) {
+      ctx.fillStyle = '#cba6f7';
+      ctx.font = '14px sans-serif';
+      ctx.fillText(this.setupMessage, this.canvas.width / 2, previewY + 120);
+    }
+  }
+
   private renderModeSelect(ctx: CanvasRenderingContext2D): void {
     ctx.fillStyle = '#1e1e2e';
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
@@ -511,6 +616,12 @@ export class Game {
     }
 
     ctx.textAlign = 'center';
+
+    if (this.finishBuildingX !== null) {
+      ctx.font = 'bold 18px sans-serif';
+      ctx.fillStyle = '#a6e3a1';
+      ctx.fillText('Head to the office!', this.canvas.width / 2, 60);
+    }
 
     if (this.phase === 'countdown') {
       ctx.font = 'bold 36px sans-serif';
