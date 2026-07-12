@@ -8,6 +8,7 @@ const SKYLINE_NEAR = '#2f2f5a';
 const GROUND_COLOR = '#3a3a4a';
 const GROUND_DASH = '#53536a';
 const WINDOW_LIT = '#f9e2af';
+const OUTLINE = '#15152a';
 
 export function drawSky(ctx: CanvasRenderingContext2D, width: number, height: number): void {
   const gradient = ctx.createLinearGradient(0, 0, 0, height);
@@ -17,8 +18,6 @@ export function drawSky(ctx: CanvasRenderingContext2D, width: number, height: nu
   ctx.fillRect(0, 0, width, height);
 }
 
-// Deterministic building-height pattern (not random per frame) so the
-// skyline tiles seamlessly as it scrolls, rather than flickering.
 const HEIGHT_PATTERN = [0.35, 0.6, 0.42, 0.75, 0.5, 0.9, 0.38, 0.65, 0.48, 0.7];
 
 function drawSkylineLayer(
@@ -31,11 +30,14 @@ function drawSkylineLayer(
   speedFactor: number,
   worldDistance: number,
   windowed: boolean,
+  alpha: number,
 ): void {
   const scrollX = worldDistance * speedFactor;
   const startIndex = Math.floor(scrollX / buildingWidth) - 1;
   const endIndex = Math.floor((scrollX + width) / buildingWidth) + 1;
 
+  ctx.save();
+  ctx.globalAlpha = alpha;
   for (let index = startIndex; index <= endIndex; index++) {
     const buildingX = index * buildingWidth - scrollX;
     const heightRatio = HEIGHT_PATTERN[((index % HEIGHT_PATTERN.length) + HEIGHT_PATTERN.length) % HEIGHT_PATTERN.length];
@@ -59,15 +61,15 @@ function drawSkylineLayer(
       }
     }
   }
+  ctx.restore();
 }
 
-/** Two parallax skyline layers — far (darker, slower) and near (lighter, faster, with windows). */
+/** Two parallax skyline layers — far layer faded for depth, near layer crisp with lit windows. */
 export function drawSkyline(ctx: CanvasRenderingContext2D, width: number, groundY: number, worldDistance: number): void {
-  drawSkylineLayer(ctx, width, groundY, SKYLINE_FAR, 70, 130, 0.12, worldDistance, false);
-  drawSkylineLayer(ctx, width, groundY, SKYLINE_NEAR, 54, 90, 0.28, worldDistance, true);
+  drawSkylineLayer(ctx, width, groundY, SKYLINE_FAR, 70, 130, 0.12, worldDistance, false, 0.55);
+  drawSkylineLayer(ctx, width, groundY, SKYLINE_NEAR, 54, 90, 0.28, worldDistance, true, 1);
 }
 
-/** Ground line plus a scrolling dash pattern so the world clearly reads as moving. */
 export function drawGround(ctx: CanvasRenderingContext2D, width: number, groundY: number, worldDistance: number): void {
   ctx.fillStyle = GROUND_COLOR;
   ctx.fillRect(0, groundY, width, 4);
@@ -92,21 +94,38 @@ function roundRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: n
   ctx.closePath();
 }
 
-const STATE_TILT: Record<PlayerState, number> = { running: 0, jumping: -0.08, ducking: 0 };
+function fillWithOutline(ctx: CanvasRenderingContext2D, fillStyle: string | CanvasGradient, lineWidth: number): void {
+  ctx.fillStyle = fillStyle;
+  ctx.fill();
+  ctx.strokeStyle = OUTLINE;
+  ctx.lineWidth = lineWidth;
+  ctx.stroke();
+}
+
+function verticalGradient(ctx: CanvasRenderingContext2D, x: number, yTop: number, yBottom: number, light: string, dark: string): CanvasGradient {
+  const g = ctx.createLinearGradient(x, yTop, x, yBottom);
+  g.addColorStop(0, light);
+  g.addColorStop(1, dark);
+  return g;
+}
 
 interface AvatarPalette {
   blazer: string;
-  accent: string; // tie / blouse trim
+  blazerDark: string;
+  accent: string;
   fur: string;
-  accessory: string; // bow / tuft color
+  furDark: string;
+  accessory: string;
 }
 
 const SUIT_COLORS: Record<PlayerAvatar, AvatarPalette> = {
-  male: { blazer: '#2c3e6b', accent: '#c0392b', fur: '#c9a06b', accessory: '#3a3a3a' },
-  female: { blazer: '#8e3b73', accent: '#f7c6de', fur: '#e0c090', accessory: '#e94f8a' },
+  male: { blazer: '#3a5a9b', blazerDark: '#20304f', accent: '#c0392b', fur: '#d4ac82', furDark: '#b3875a', accessory: '#3a3a3a' },
+  female: { blazer: '#a84f8c', blazerDark: '#5f2850', accent: '#f7c6de', fur: '#eccb99', furDark: '#d4a86a', accessory: '#e94f8a' },
 };
 
-/** A cute cartoon dog in corporate attire, with a walking bounce and gender-distinct details. */
+const STATE_TILT: Record<PlayerState, number> = { running: 0, jumping: -0.06, ducking: 0 };
+
+/** A cute cartoon dog in corporate attire — outlined flat-vector style with gradients, ground shadow, and squash/stretch. */
 export function drawPlayer(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -119,22 +138,35 @@ export function drawPlayer(
   flashColor: string | null,
 ): void {
   const palette = SUIT_COLORS[avatar];
-  const blazer = flashColor ?? palette.blazer;
   const centerX = x + width / 2;
 
   const stridePhase = worldDistance * 0.02;
   const bounce = state === 'running' ? Math.abs(Math.sin(stridePhase)) * height * 0.07 : 0;
   const y = yIn - bounce;
+  const feetY = y + height;
 
-  const headY = y + height * 0.17;
-  const headRadius = width * 0.36;
+  // Ground-contact shadow — grounds the character and reinforces squash/stretch.
+  const squashAmount = state === 'ducking' ? 1.25 : state === 'jumping' ? 0.6 : 1;
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.28)';
+  ctx.beginPath();
+  ctx.ellipse(centerX, feetY + 4, width * 0.42 * squashAmount, width * 0.14 * squashAmount, 0, 0, Math.PI * 2);
+  ctx.fill();
 
   ctx.save();
   ctx.translate(centerX, y);
   ctx.rotate(STATE_TILT[state]);
   ctx.translate(-centerX, -y);
 
-  // Tail — wags side to side while running, tucked while ducking, up while jumping.
+  // Squash & stretch, anchored at the feet so the character stays grounded.
+  const scaleX = state === 'jumping' ? 0.92 : state === 'ducking' ? 1.1 : 1;
+  const scaleY = state === 'jumping' ? 1.1 : state === 'ducking' ? 0.9 : 1;
+  ctx.translate(centerX, feetY);
+  ctx.scale(scaleX, scaleY);
+  ctx.translate(-centerX, -feetY);
+
+  const outlineW = Math.max(1.5, width * 0.045);
+
+  // Tail
   const tailWag = state === 'running' ? Math.sin(stridePhase * 1.3) * 0.35 : state === 'jumping' ? 0.5 : -0.1;
   ctx.strokeStyle = palette.fur;
   ctx.lineWidth = Math.max(3, width * 0.1);
@@ -148,9 +180,12 @@ export function drawPlayer(
     y + height * 0.05,
   );
   ctx.stroke();
+  ctx.lineWidth = outlineW * 0.7;
+  ctx.strokeStyle = OUTLINE;
+  ctx.stroke();
 
-  // Torso (suit) — female gets a flared peplum hem, male a straight blazer.
-  ctx.fillStyle = blazer;
+  // Torso — gradient shaded, flared hem for female
+  const torsoGradient = verticalGradient(ctx, centerX, y + height * 0.32, y + height * 0.87, palette.blazer, palette.blazerDark);
   if (avatar === 'female') {
     const top = y + height * 0.32;
     const bottom = y + height * 0.87;
@@ -163,13 +198,12 @@ export function drawPlayer(
     ctx.lineTo(x + width + flare, bottom);
     ctx.lineTo(x - flare, bottom);
     ctx.closePath();
-    ctx.fill();
   } else {
     roundRectPath(ctx, x, y + height * 0.32, width, height * 0.55, 5);
-    ctx.fill();
   }
+  fillWithOutline(ctx, torsoGradient, outlineW);
 
-  // Shirt collar peeking above the blazer
+  // Shirt collar
   ctx.fillStyle = '#f5f5f5';
   ctx.beginPath();
   ctx.moveTo(centerX - width * 0.14, y + height * 0.34);
@@ -177,9 +211,11 @@ export function drawPlayer(
   ctx.lineTo(centerX + width * 0.14, y + height * 0.34);
   ctx.closePath();
   ctx.fill();
+  ctx.strokeStyle = OUTLINE;
+  ctx.lineWidth = outlineW * 0.6;
+  ctx.stroke();
 
-  // Tie (male) / bow-front blouse accent (female)
-  ctx.fillStyle = palette.accent;
+  // Tie (male) / bow-front (female)
   if (avatar === 'male') {
     ctx.beginPath();
     ctx.moveTo(centerX - width * 0.05, y + height * 0.4);
@@ -188,17 +224,18 @@ export function drawPlayer(
     ctx.lineTo(centerX, y + height * 0.85);
     ctx.lineTo(centerX - width * 0.08, y + height * 0.78);
     ctx.closePath();
-    ctx.fill();
+    fillWithOutline(ctx, palette.accent, outlineW * 0.6);
   } else {
     ctx.beginPath();
     ctx.arc(centerX - width * 0.06, y + height * 0.42, width * 0.06, 0, Math.PI * 2);
     ctx.arc(centerX + width * 0.06, y + height * 0.42, width * 0.06, 0, Math.PI * 2);
-    ctx.fill();
+    fillWithOutline(ctx, palette.accent, outlineW * 0.5);
   }
 
   // Legs
-  ctx.strokeStyle = blazer;
+  ctx.strokeStyle = palette.blazerDark;
   ctx.lineWidth = Math.max(3, width * 0.12);
+  ctx.lineCap = 'round';
   const legTop = y + height * 0.82;
   const legLength = height * 0.28;
   ctx.beginPath();
@@ -221,40 +258,41 @@ export function drawPlayer(
   }
   ctx.stroke();
 
-  // Head (fur) — slight bob, offset from the body bounce for a livelier feel
+  // Head — gradient shaded, smooth muzzle blended via overlapping soft shapes
   const headBob = state === 'running' ? Math.sin(stridePhase * 2) * height * 0.015 : 0;
+  const headY = y + height * 0.17;
   const hY = headY + headBob;
+  const headRadius = width * 0.36;
+  const headGradient = verticalGradient(ctx, centerX, hY - headRadius, hY + headRadius, palette.fur, palette.furDark);
 
-  ctx.fillStyle = palette.fur;
+  // Ears — smooth curved (bezier) floppy shape instead of sharp triangles
+  const earSwing = state === 'running' ? Math.sin(stridePhase * 1.5) * 0.12 : 0;
+  for (const side of [-1, 1] as const) {
+    ctx.beginPath();
+    const baseX = centerX + side * headRadius * 0.7;
+    const baseY = hY - headRadius * (0.3 - earSwing * side);
+    const tipX = centerX + side * headRadius * 1.3;
+    const tipY = hY + headRadius * (0.65 + earSwing * side);
+    ctx.moveTo(baseX, baseY);
+    ctx.quadraticCurveTo(centerX + side * headRadius * 1.5, hY + headRadius * 0.2, tipX, tipY);
+    ctx.quadraticCurveTo(centerX + side * headRadius * 0.5, hY + headRadius * 0.5, centerX + side * headRadius * 0.3, hY + headRadius * 0.15);
+    ctx.closePath();
+    fillWithOutline(ctx, palette.furDark, outlineW * 0.6);
+  }
+
+  // Head silhouette (circle) + snout blended as one visual mass
   ctx.beginPath();
   ctx.arc(centerX, hY, headRadius, 0, Math.PI * 2);
-  ctx.fill();
+  fillWithOutline(ctx, headGradient, outlineW);
 
-  // Ears — floppy, with a small animated swing while running
-  const earSwing = state === 'running' ? Math.sin(stridePhase * 1.5) * 0.12 : 0;
-  ctx.fillStyle = palette.fur;
-  ctx.beginPath();
-  ctx.moveTo(centerX - headRadius * 0.7, hY - headRadius * (0.3 - earSwing));
-  ctx.lineTo(centerX - headRadius * 1.3, hY + headRadius * (0.6 + earSwing));
-  ctx.lineTo(centerX - headRadius * 0.3, hY + headRadius * 0.2);
-  ctx.closePath();
-  ctx.fill();
-  ctx.beginPath();
-  ctx.moveTo(centerX + headRadius * 0.7, hY - headRadius * (0.3 + earSwing));
-  ctx.lineTo(centerX + headRadius * 1.3, hY + headRadius * (0.6 - earSwing));
-  ctx.lineTo(centerX + headRadius * 0.3, hY + headRadius * 0.2);
-  ctx.closePath();
-  ctx.fill();
-
-  // Gender accessory: spiky tuft (male) or head bow (female)
-  ctx.fillStyle = palette.accessory;
+  // Gender accessory
   if (avatar === 'male') {
     ctx.beginPath();
     ctx.moveTo(centerX - headRadius * 0.2, hY - headRadius * 0.95);
     ctx.lineTo(centerX, hY - headRadius * 1.35);
     ctx.lineTo(centerX + headRadius * 0.2, hY - headRadius * 0.95);
     ctx.closePath();
-    ctx.fill();
+    fillWithOutline(ctx, palette.accessory, outlineW * 0.5);
   } else {
     const bowY = hY - headRadius * 1.05;
     ctx.beginPath();
@@ -262,32 +300,30 @@ export function drawPlayer(
     ctx.lineTo(centerX - headRadius * 0.4, bowY - headRadius * 0.25);
     ctx.lineTo(centerX - headRadius * 0.4, bowY + headRadius * 0.25);
     ctx.closePath();
-    ctx.fill();
+    fillWithOutline(ctx, palette.accessory, outlineW * 0.4);
     ctx.beginPath();
     ctx.moveTo(centerX, bowY);
     ctx.lineTo(centerX + headRadius * 0.4, bowY - headRadius * 0.25);
     ctx.lineTo(centerX + headRadius * 0.4, bowY + headRadius * 0.25);
     ctx.closePath();
-    ctx.fill();
+    fillWithOutline(ctx, palette.accessory, outlineW * 0.4);
     ctx.beginPath();
     ctx.arc(centerX, bowY, headRadius * 0.14, 0, Math.PI * 2);
-    ctx.fill();
+    fillWithOutline(ctx, palette.accessory, outlineW * 0.4);
   }
 
-  // Blush cheeks
-  ctx.fillStyle = 'rgba(240, 130, 150, 0.55)';
+  // Blush
+  ctx.fillStyle = 'rgba(240, 130, 150, 0.5)';
   ctx.beginPath();
   ctx.ellipse(centerX - headRadius * 0.55, hY + headRadius * 0.25, headRadius * 0.18, headRadius * 0.1, 0, 0, Math.PI * 2);
   ctx.ellipse(centerX + headRadius * 0.55, hY + headRadius * 0.25, headRadius * 0.18, headRadius * 0.1, 0, 0, Math.PI * 2);
   ctx.fill();
 
   // Snout
-  ctx.fillStyle = palette.fur;
   ctx.beginPath();
   ctx.ellipse(centerX, hY + headRadius * 0.45, headRadius * 0.45, headRadius * 0.32, 0, 0, Math.PI * 2);
-  ctx.fill();
+  fillWithOutline(ctx, palette.fur, outlineW * 0.6);
 
-  // Tongue (only while running — a happy little pant)
   if (state === 'running') {
     ctx.fillStyle = '#e88ba0';
     ctx.beginPath();
@@ -295,13 +331,11 @@ export function drawPlayer(
     ctx.fill();
   }
 
-  // Nose
   ctx.fillStyle = '#2b2b2b';
   ctx.beginPath();
   ctx.arc(centerX, hY + headRadius * 0.4, headRadius * 0.12, 0, Math.PI * 2);
   ctx.fill();
 
-  // Eyes — bigger, with a sparkle highlight, and eyelashes on the female
   const eyeY = hY - headRadius * 0.1;
   ctx.fillStyle = '#241f1f';
   ctx.beginPath();
@@ -326,6 +360,17 @@ export function drawPlayer(
   }
 
   ctx.restore();
+
+  // Hit flash — a translucent tint drawn OVER the finished character, so
+  // the avatar's real colors never change; this is purely an overlay.
+  if (flashColor) {
+    ctx.save();
+    ctx.globalAlpha = 0.45;
+    ctx.fillStyle = flashColor;
+    roundRectPath(ctx, x - width * 0.15, y, width * 1.3, height, 8);
+    ctx.fill();
+    ctx.restore();
+  }
 }
 
 /** Jump obstacles are briefcases; duck obstacles are hanging pendant lamps — both fit the office theme. */
@@ -337,17 +382,21 @@ export function drawObstacle(
   height: number,
   type: ObstacleType,
 ): void {
+  const outlineW = Math.max(1.5, width * 0.04);
+
   if (type === 'jump') {
-    // Briefcase body
-    ctx.fillStyle = '#8b5e34';
-    roundRectPath(ctx, x, y + height * 0.25, width, height * 0.75, 4);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+    ctx.beginPath();
+    ctx.ellipse(x + width / 2, y + height + 4, width * 0.55, height * 0.12, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Darker base strip
-    ctx.fillStyle = '#6e4726';
-    ctx.fillRect(x, y + height * 0.85, width, height * 0.15);
+    const bodyGradient = verticalGradient(ctx, x, y + height * 0.25, y + height, '#a3703f', '#6e4726');
+    roundRectPath(ctx, x, y + height * 0.25, width, height * 0.75, 4);
+    fillWithOutline(ctx, bodyGradient, outlineW);
 
-    // Handle
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.fillRect(x + width * 0.12, y + height * 0.3, width * 0.12, height * 0.55);
+
     ctx.strokeStyle = '#2b2b2b';
     ctx.lineWidth = 3;
     ctx.beginPath();
@@ -357,12 +406,12 @@ export function drawObstacle(
     ctx.lineTo(x + width * 0.7, y + height * 0.25);
     ctx.stroke();
 
-    // Latches
-    ctx.fillStyle = '#d4af37';
-    ctx.fillRect(x + width * 0.2, y + height * 0.45, width * 0.1, height * 0.12);
-    ctx.fillRect(x + width * 0.7, y + height * 0.45, width * 0.1, height * 0.12);
+    ctx.fillStyle = '#e6c455';
+    ctx.beginPath();
+    ctx.rect(x + width * 0.2, y + height * 0.45, width * 0.1, height * 0.12);
+    ctx.rect(x + width * 0.7, y + height * 0.45, width * 0.1, height * 0.12);
+    fillWithOutline(ctx, '#e6c455', outlineW * 0.5);
   } else {
-    // Hanging pendant lamp — cord from the ceiling down to a lit shade
     ctx.strokeStyle = '#53536a';
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -370,33 +419,33 @@ export function drawObstacle(
     ctx.lineTo(x + width / 2, y);
     ctx.stroke();
 
-    // Lampshade (trapezoid)
-    ctx.fillStyle = '#cba6f7';
     ctx.beginPath();
     ctx.moveTo(x + width * 0.3, y);
     ctx.lineTo(x + width * 0.7, y);
     ctx.lineTo(x + width, y + height);
     ctx.lineTo(x, y + height);
     ctx.closePath();
+    fillWithOutline(ctx, '#cba6f7', outlineW);
+
+    ctx.fillStyle = 'rgba(249, 226, 175, 0.35)';
+    ctx.beginPath();
+    ctx.arc(x + width / 2, y + height + 6, width * 0.55, 0, Math.PI * 2);
     ctx.fill();
 
-    // Glowing bulb peeking below the shade
     ctx.fillStyle = WINDOW_LIT;
     ctx.beginPath();
     ctx.arc(x + width / 2, y + height + 4, width * 0.14, 0, Math.PI * 2);
-    ctx.fill();
+    fillWithOutline(ctx, WINDOW_LIT, outlineW * 0.5);
   }
 }
 
-/** Simple warning-triangle icon, used on the Game Over mode-select card. */
 export function drawWarningIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number): void {
-  ctx.fillStyle = '#f38ba8';
   ctx.beginPath();
   ctx.moveTo(x, y - size / 2);
   ctx.lineTo(x + size / 2, y + size / 2);
   ctx.lineTo(x - size / 2, y + size / 2);
   ctx.closePath();
-  ctx.fill();
+  fillWithOutline(ctx, '#f38ba8', 2);
 
   ctx.fillStyle = '#1e1e2e';
   ctx.fillRect(x - size * 0.06, y - size * 0.15, size * 0.12, size * 0.3);
@@ -405,15 +454,15 @@ export function drawWarningIcon(ctx: CanvasRenderingContext2D, x: number, y: num
   ctx.fill();
 }
 
-/** Simple trophy icon, used on the Score mode-select card. */
 export function drawTrophyIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number): void {
-  ctx.fillStyle = '#f9e2af';
   roundRectPath(ctx, x - size * 0.3, y - size * 0.4, size * 0.6, size * 0.5, 3);
-  ctx.fill();
+  fillWithOutline(ctx, '#f9e2af', 2);
+  ctx.strokeStyle = OUTLINE;
   ctx.beginPath();
   ctx.arc(x - size * 0.3, y - size * 0.25, size * 0.15, Math.PI * 0.3, Math.PI * 1.2);
   ctx.arc(x + size * 0.3, y - size * 0.25, size * 0.15, Math.PI * 1.8, Math.PI * 0.7);
   ctx.stroke();
+  ctx.fillStyle = '#f9e2af';
   ctx.fillRect(x - size * 0.08, y + size * 0.1, size * 0.16, size * 0.18);
   ctx.fillRect(x - size * 0.2, y + size * 0.28, size * 0.4, size * 0.08);
 }
@@ -423,12 +472,15 @@ const OFFICE_HEIGHT = 260;
 
 export { OFFICE_WIDTH, OFFICE_HEIGHT };
 
-/** The distinctive "finish line" office tower each level ends at — brighter and taller than the background skyline. */
 export function drawOfficeBuilding(ctx: CanvasRenderingContext2D, x: number, groundY: number): void {
   const top = groundY - OFFICE_HEIGHT;
+  const bodyGradient = verticalGradient(ctx, x, top, groundY, '#4a4a82', '#2e2e56');
 
-  ctx.fillStyle = '#3d3d6b';
+  ctx.fillStyle = bodyGradient;
   ctx.fillRect(x, top, OFFICE_WIDTH, OFFICE_HEIGHT);
+  ctx.strokeStyle = OUTLINE;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x, top, OFFICE_WIDTH, OFFICE_HEIGHT);
 
   ctx.fillStyle = WINDOW_LIT;
   const cols = 4;
