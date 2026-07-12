@@ -11,18 +11,9 @@ import { PoseDetector } from '../pose/PoseDetector';
 import { PoseCalibrator } from '../pose/PoseCalibrator';
 import { PoseInput } from '../pose/PoseInput';
 import { computeBodyCenterY } from '../pose/bodyMetrics';
+import { countRaisedHands } from '../pose/handGesture';
+import { drawSky, drawHills, drawGround, drawPlayer, drawObstacle } from '../render/draw';
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision';
-
-const STATE_COLORS: Record<Player['state'], string> = {
-  running: '#89b4fa',
-  jumping: '#a6e3a1',
-  ducking: '#f9e2af',
-};
-
-const OBSTACLE_COLORS = {
-  jump: '#f38ba8',
-  duck: '#cba6f7',
-};
 
 const COUNTDOWN_STAGES = ['Ready', 'Set', 'Go!'];
 const COUNTDOWN_STAGE_DURATION = 0.7;
@@ -32,7 +23,8 @@ const HIT_FLASH_DURATION = 0.2;
 
 const SCORE_PER_CLEAR = 1;
 const SCORE_PENALTY_PER_COLLISION = 2;
-const LEVEL_SCORE_TARGET = 10; // Score mode: net points needed to clear each level
+const LEVEL_SCORE_TARGET = 10;
+const HAND_GESTURE_CONFIRM_MS = 350; // Score mode: net points needed to clear each level
 
 type GameMode = 'score' | 'retry';
 type Phase = 'loadingPose' | 'calibrating' | 'modeSelect' | 'countdown' | 'running' | 'celebrating' | 'levelRetry' | 'setComplete';
@@ -56,6 +48,10 @@ export class Game {
   private calibrator: PoseCalibrator | null = null;
   private setupMessage = '';
 
+  // Debounce for mode-select hand-raise gesture (mirrors the duck debounce pattern).
+  private handRaiseCandidateCount: number | null = null;
+  private handRaiseCandidateSinceMs: number | null = null;
+
   private phase: Phase = 'loadingPose';
   private mode: GameMode | null = null;
 
@@ -78,6 +74,7 @@ export class Game {
 
   private retryTimer = 0;
   private hitFlashTimer = 0;
+  private worldDistance = 0; // accumulated scroll distance, drives parallax + running-leg animation
 
   constructor(container: HTMLElement) {
     this.canvas = new GameCanvas(container);
@@ -140,14 +137,42 @@ export class Game {
       if (this.calibrator.isComplete && this.calibrator.baseline !== null && this.poseInput) {
         this.poseInput.setBaseline(this.calibrator.baseline);
         this.inputMode = 'pose';
-        this.setupMessage = 'Move your whole body up to jump, crouch down to duck!';
+        this.setupMessage = 'Raise one hand for Score mode, both hands for Game Over mode';
         this.phase = 'modeSelect';
       }
       return;
     }
 
     if (this.inputMode === 'pose' && this.poseInput) {
-      this.poseInput.updateFromLandmarks(landmarks);
+      this.poseInput.updateFromLandmarks(landmarks, timestampMs);
+
+      // Mode selection by hand-raise gesture — deliberately separate from
+      // jump/duck (rather than reusing them) so the player doesn't need to
+      // walk back to the laptop after calibration, and so gameplay gestures
+      // stay reserved for gameplay. One hand raised = Score, both = Game
+      // Over. Debounced the same way duck is, so a hand passing briefly
+      // through the raised zone doesn't cause an accidental selection.
+      if (this.phase === 'modeSelect') {
+        this.updateModeSelectGesture(landmarks, timestampMs);
+      }
+    }
+  }
+
+  private updateModeSelectGesture(landmarks: NormalizedLandmark[], timestampMs: number): void {
+    const raisedCount = countRaisedHands(landmarks);
+
+    if (raisedCount !== this.handRaiseCandidateCount) {
+      this.handRaiseCandidateCount = raisedCount;
+      this.handRaiseCandidateSinceMs = timestampMs;
+    }
+
+    const elapsed = this.handRaiseCandidateSinceMs === null ? 0 : timestampMs - this.handRaiseCandidateSinceMs;
+    if (elapsed < HAND_GESTURE_CONFIRM_MS) return;
+
+    if (raisedCount === 1) {
+      this.selectMode('score');
+    } else if (raisedCount === 2) {
+      this.selectMode('retry');
     }
   }
 
@@ -163,15 +188,17 @@ export class Game {
     if (this.phase !== 'modeSelect') return;
 
     if (event.code === 'Digit1' || event.code === 'Numpad1') {
-      this.mode = 'score';
-      this.spawner.reset(this.levelManager.config.minGapPx);
-      this.beginCountdown();
+      this.selectMode('score');
     } else if (event.code === 'Digit2' || event.code === 'Numpad2') {
-      this.mode = 'retry';
-      this.spawner.reset(this.levelManager.config.minGapPx);
-      this.beginCountdown();
+      this.selectMode('retry');
     }
   };
+
+  private selectMode(mode: GameMode): void {
+    this.mode = mode;
+    this.spawner.reset(this.levelManager.config.minGapPx);
+    this.beginCountdown();
+  }
 
   private beginCountdown(): void {
     this.countdownStageIndex = 0;
@@ -246,6 +273,7 @@ export class Game {
 
   private updateScoreMode(dt: number): void {
     const config = this.levelManager.config;
+    this.worldDistance += config.scrollSpeed * dt;
     const result = this.spawner.update(dt, config, this.groundY(), this.canvas.width, this.player);
 
     if (result.collidedCount > 0) {
@@ -280,6 +308,7 @@ export class Game {
 
   private updateRetryMode(dt: number): void {
     const config = this.levelManager.config;
+    this.worldDistance += config.scrollSpeed * dt;
     const result = this.spawner.update(dt, config, this.groundY(), this.canvas.width, this.player);
 
     if (result.collidedCount > 0) {
@@ -354,20 +383,25 @@ export class Game {
 
     const groundY = this.groundY();
 
-    ctx.fillStyle = '#1e1e2e';
-    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-
-    ctx.fillStyle = '#3a3a4a';
-    ctx.fillRect(0, groundY, this.canvas.width, 2);
+    drawSky(ctx, this.canvas.width, this.canvas.height);
+    drawHills(ctx, this.canvas.width, groundY, this.worldDistance);
+    drawGround(ctx, this.canvas.width, groundY, this.worldDistance);
 
     for (const obstacle of this.spawner.all) {
-      ctx.fillStyle = OBSTACLE_COLORS[obstacle.type];
-      ctx.fillRect(obstacle.interpolatedX(alpha), obstacle.y, obstacle.width, obstacle.height);
+      drawObstacle(ctx, obstacle.interpolatedX(alpha), obstacle.y, obstacle.width, obstacle.height, obstacle.type);
     }
 
     const playerY = this.player.interpolatedY(alpha);
-    ctx.fillStyle = this.hitFlashTimer > 0 ? '#f38ba8' : STATE_COLORS[this.player.state];
-    ctx.fillRect(this.player.x, playerY, this.player.width, this.player.height);
+    drawPlayer(
+      ctx,
+      this.player.x,
+      playerY,
+      this.player.width,
+      this.player.height,
+      this.player.state,
+      this.worldDistance,
+      this.hitFlashTimer > 0 ? '#f38ba8' : null,
+    );
 
     this.renderHud(ctx);
   }
@@ -394,20 +428,35 @@ export class Game {
       ctx.restore();
     }
 
-    const progress = this.calibrator ? this.calibrator.progress(performance.now()) : 0;
+    const now = performance.now();
+    const calibrationPhase = this.calibrator ? this.calibrator.phase(now) : 'warmup';
+    const isWarmup = calibrationPhase === 'warmup';
+    const progress = this.calibrator
+      ? isWarmup
+        ? this.calibrator.warmupProgress(now)
+        : this.calibrator.samplingProgress(now)
+      : 0;
 
     ctx.textAlign = 'center';
     ctx.fillStyle = '#f5f5f5';
     ctx.font = 'bold 22px sans-serif';
-    ctx.fillText('Stand naturally, arms visible...', this.canvas.width / 2, 40);
+    ctx.fillText(
+      isWarmup ? 'Step into frame and stand naturally...' : 'Hold still — calibrating...',
+      this.canvas.width / 2,
+      40,
+    );
     ctx.font = '16px sans-serif';
-    ctx.fillText(`Calibrating: ${Math.round(progress * 100)}%`, this.canvas.width / 2, 68);
+    ctx.fillText(
+      isWarmup ? 'Get ready' : `Calibrating: ${Math.round(progress * 100)}%`,
+      this.canvas.width / 2,
+      68,
+    );
 
     const barWidth = 240;
     const barX = this.canvas.width / 2 - barWidth / 2;
     ctx.fillStyle = '#3a3a4a';
     ctx.fillRect(barX, 84, barWidth, 8);
-    ctx.fillStyle = '#a6e3a1';
+    ctx.fillStyle = isWarmup ? '#89b4fa' : '#a6e3a1';
     ctx.fillRect(barX, 84, barWidth * progress, 8);
   }
 
@@ -423,13 +472,17 @@ export class Game {
     ctx.font = '18px sans-serif';
     ctx.fillStyle = '#89b4fa';
     ctx.fillText(
-      `[1]  Score mode — reach ${LEVEL_SCORE_TARGET} points to clear each level (+${SCORE_PER_CLEAR} clear, -${SCORE_PENALTY_PER_COLLISION} hit)`,
+      this.inputMode === 'pose'
+        ? `[Raise 1 hand]  Score mode — reach ${LEVEL_SCORE_TARGET} points to clear each level (+${SCORE_PER_CLEAR} clear, -${SCORE_PENALTY_PER_COLLISION} hit)`
+        : `[1]  Score mode — reach ${LEVEL_SCORE_TARGET} points to clear each level (+${SCORE_PER_CLEAR} clear, -${SCORE_PENALTY_PER_COLLISION} hit)`,
       this.canvas.width / 2,
       this.canvas.height / 2,
     );
     ctx.fillStyle = '#f38ba8';
     ctx.fillText(
-      '[2]  Game Over mode — clear every obstacle; a single hit means redoing the level',
+      this.inputMode === 'pose'
+        ? '[Raise 2 hands]  Game Over mode — clear every obstacle; a single hit means redoing the level'
+        : '[2]  Game Over mode — clear every obstacle; a single hit means redoing the level',
       this.canvas.width / 2,
       this.canvas.height / 2 + 32,
     );
