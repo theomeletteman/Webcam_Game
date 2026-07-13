@@ -454,7 +454,7 @@ export class Game {
     drawGround(ctx, this.canvas.width, groundY, this.worldDistance);
 
     for (const obstacle of this.spawner.all) {
-      drawObstacle(ctx, obstacle.interpolatedX(alpha), obstacle.y, obstacle.width, obstacle.height, obstacle.type);
+      drawObstacle(ctx, obstacle.interpolatedX(alpha), obstacle.y, obstacle.width, obstacle.height, obstacle.type, obstacle.jumpVariant);
     }
 
     if (this.finishBuildingX !== null) {
