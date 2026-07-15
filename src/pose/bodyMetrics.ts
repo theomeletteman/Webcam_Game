@@ -19,6 +19,12 @@ const MIN_VISIBILITY = 0.5;
  * callers should simply skip the frame rather than act on noisy data.
  */
 export function computeBodyCenterY(landmarks: NormalizedLandmark[]): number | null {
+  const center = computeBodyCenter(landmarks);
+  return center ? center.y : null;
+}
+
+/** Same 4-point average as computeBodyCenterY, but returns both axes — used for lean (left/right) detection. */
+export function computeBodyCenter(landmarks: NormalizedLandmark[]): { x: number; y: number } | null {
   const points = [LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP].map((i) => landmarks[i]);
 
   for (const point of points) {
@@ -27,6 +33,7 @@ export function computeBodyCenterY(landmarks: NormalizedLandmark[]): number | nu
     }
   }
 
-  const sum = points.reduce((acc, point) => acc + point.y, 0);
-  return sum / points.length;
+  const sumX = points.reduce((acc, point) => acc + point.x, 0);
+  const sumY = points.reduce((acc, point) => acc + point.y, 0);
+  return { x: sumX / points.length, y: sumY / points.length };
 }

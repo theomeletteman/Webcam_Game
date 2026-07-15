@@ -1,6 +1,6 @@
 import type { PlayerState, PlayerAvatar } from '../entities/Player';
 import type { ObstacleType, JumpVariant } from '../entities/Obstacle';
-import { getPlayerSprite, getSprite } from './sprites';
+import { getPlayerSprite, getSprite, getDodgeSprite, type DodgePose } from './sprites';
 
 const SKY_TOP = '#1a1a2e';
 const SKY_BOTTOM = '#2d2d4a';
@@ -94,13 +94,6 @@ function roundRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: n
   ctx.closePath();
 }
 
-function verticalGradient(ctx: CanvasRenderingContext2D, x: number, yTop: number, yBottom: number, light: string, dark: string): CanvasGradient {
-  const g = ctx.createLinearGradient(x, yTop, x, yBottom);
-  g.addColorStop(0, light);
-  g.addColorStop(1, dark);
-  return g;
-}
-
 /** Scale factors to fit an image to a target height while preserving its natural aspect ratio. */
 function fitToHeight(img: HTMLImageElement, targetHeight: number): { width: number; height: number } {
   const scale = targetHeight / img.naturalHeight;
@@ -126,9 +119,7 @@ const STATE_TILT: Record<PlayerState, number> = { running: 0, jumping: -0.06, du
 
 /**
  * Real character artwork (see /public/sprites) — running has a real 2-frame
- * leg cycle, ducking uses a dedicated crouch pose. Jumping temporarily
- * reuses a running frame until a dedicated mid-air pose is added (see
- * render/sprites.ts).
+ * leg cycle (3 frames), plus dedicated jumping and ducking poses.
  */
 export function drawPlayer(
   ctx: CanvasRenderingContext2D,
@@ -156,7 +147,7 @@ export function drawPlayer(
   ctx.fill();
 
   // Stepped (not continuous) frame alternation — matches real footfall timing better than a sine blend.
-  const frame: 0 | 1 = Math.floor(worldDistance / 40) % 2 === 0 ? 0 : 1;
+  const frame: 0 | 1 | 2 = (Math.floor(worldDistance / 32) % 3) as 0 | 1 | 2;
   const sprite = getPlayerSprite(avatar, state, frame);
 
   if (!sprite || !sprite.complete || sprite.naturalWidth === 0) {
@@ -255,35 +246,133 @@ export function drawTrophyIcon(ctx: CanvasRenderingContext2D, x: number, y: numb
   ctx.fillRect(x - size * 0.2, y + size * 0.28, size * 0.4, size * 0.08);
 }
 
-const OFFICE_WIDTH = 100;
-const OFFICE_HEIGHT = 260;
+// Logical placement/collision box — the actual rendered image is scaled to
+// fit this height preserving its own aspect ratio, so real pixel size may
+// differ slightly; same looseness already accepted for obstacle sprites.
+export function drawDodgeIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number): void {
+  ctx.strokeStyle = '#a6e3a1';
+  ctx.lineWidth = Math.max(2, size * 0.12);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x - size * 0.1, y - size * 0.35);
+  ctx.lineTo(x - size * 0.4, y);
+  ctx.lineTo(x - size * 0.1, y + size * 0.35);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x + size * 0.1, y - size * 0.35);
+  ctx.lineTo(x + size * 0.4, y);
+  ctx.lineTo(x + size * 0.1, y + size * 0.35);
+  ctx.stroke();
+}
 
-export { OFFICE_WIDTH, OFFICE_HEIGHT };
+const OFFICE_WIDTH = 130;
+const OFFICE_HEIGHT = 300;
+const HOME_WIDTH = 150;
+const HOME_HEIGHT = 260;
+
+export { OFFICE_WIDTH, OFFICE_HEIGHT, HOME_WIDTH, HOME_HEIGHT };
 
 export function drawOfficeBuilding(ctx: CanvasRenderingContext2D, x: number, groundY: number): void {
-  const top = groundY - OFFICE_HEIGHT;
-  const bodyGradient = verticalGradient(ctx, x, top, groundY, '#4a4a82', '#2e2e56');
+  const sprite = getSprite('office');
+  const centerX = x + OFFICE_WIDTH / 2;
+  if (sprite && sprite.complete && sprite.naturalWidth > 0) {
+    drawSpriteBottomAnchored(ctx, sprite, centerX, groundY, OFFICE_HEIGHT);
+  }
+  ctx.fillStyle = '#a6e3a1';
+  ctx.font = 'bold 14px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('OFFICE', centerX, groundY - OFFICE_HEIGHT - 8);
+}
 
-  ctx.fillStyle = bodyGradient;
-  ctx.fillRect(x, top, OFFICE_WIDTH, OFFICE_HEIGHT);
-  ctx.strokeStyle = OUTLINE;
-  ctx.lineWidth = 2;
-  ctx.strokeRect(x, top, OFFICE_WIDTH, OFFICE_HEIGHT);
+/** The finish line for the "Weekly Dodge" mode — the character's home. */
+export function drawHomeBuilding(ctx: CanvasRenderingContext2D, x: number, groundY: number): void {
+  const sprite = getSprite('home');
+  const centerX = x + HOME_WIDTH / 2;
+  if (sprite && sprite.complete && sprite.naturalWidth > 0) {
+    drawSpriteBottomAnchored(ctx, sprite, centerX, groundY, HOME_HEIGHT);
+  }
+  ctx.fillStyle = '#a6e3a1';
+  ctx.font = 'bold 14px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('HOME', centerX, groundY - HOME_HEIGHT - 8);
+}
 
-  ctx.fillStyle = WINDOW_LIT;
-  const cols = 4;
-  const rows = Math.floor(OFFICE_HEIGHT / 22);
-  for (let row = 1; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
-      ctx.fillRect(x + 10 + col * 20, top + 10 + row * 22, 12, 14);
-    }
+/**
+ * Front-facing character for the "Weekly Dodge" mode — the character faces
+ * the camera (the player "is" the incoming item's perspective), and leans
+ * left/right or ducks in place rather than running.
+ */
+export function drawDodgeCharacter(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  pose: DodgePose,
+  avatar: PlayerAvatar,
+  idlePhase: number,
+  flashColor: string | null,
+): void {
+  const centerX = x + width / 2;
+  const bob = pose === 'stand' ? Math.sin(idlePhase * 0.05) * height * 0.02 : 0;
+  const feetY = y + height;
+
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.28)';
+  ctx.beginPath();
+  ctx.ellipse(centerX, feetY + 4, width * 0.45, width * 0.14, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  const sprite = getDodgeSprite(avatar, pose);
+  if (!sprite || !sprite.complete || sprite.naturalWidth === 0) {
+    ctx.fillStyle = avatar === 'male' ? '#3a5a9b' : '#a84f8c';
+    roundRectPath(ctx, x, y, width, height, 6);
+    ctx.fill();
+    return;
   }
 
-  ctx.fillStyle = '#1e1e2e';
-  ctx.fillRect(x + OFFICE_WIDTH / 2 - 14, groundY - 34, 28, 34);
+  const bounds = drawSpriteBottomAnchored(ctx, sprite, centerX, feetY - bob, height);
 
-  ctx.fillStyle = '#a6e3a1';
-  ctx.font = 'bold 13px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillText('OFFICE', x + OFFICE_WIDTH / 2, top - 10);
+  if (flashColor) {
+    ctx.save();
+    ctx.globalAlpha = 0.4;
+    ctx.fillStyle = flashColor;
+    ctx.fillRect(bounds.x, bounds.y, bounds.width, bounds.height);
+    ctx.restore();
+  }
 }
+
+/**
+ * An incoming work-item "card" for the Weekly Dodge mode — grows in scale
+ * as it approaches (0 = just appeared, far away; 1 = reached the player).
+ */
+export function drawIncomingItem(ctx: CanvasRenderingContext2D, x: number, y: number, progress: number, label: string): void {
+  const scale = 0.25 + progress * 0.9;
+  const w = 88 * scale;
+  const h = 56 * scale;
+
+  ctx.save();
+  ctx.globalAlpha = Math.min(1, 0.3 + progress * 0.9);
+  ctx.translate(x, y);
+  ctx.rotate(Math.sin(progress * 6) * 0.08);
+
+  roundRectPath(ctx, -w / 2, -h / 2, w, h, 6 * scale);
+  ctx.fillStyle = '#3d3d6b';
+  ctx.fill();
+  ctx.strokeStyle = OUTLINE;
+  ctx.lineWidth = Math.max(1, 2 * scale);
+  ctx.stroke();
+
+  ctx.fillStyle = '#f38ba8';
+  ctx.fillRect(-w / 2, -h / 2, w, h * 0.28);
+
+  ctx.fillStyle = '#f5f5f5';
+  ctx.font = `bold ${Math.max(8, 11 * scale)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, 0, h * 0.15);
+  ctx.textBaseline = 'alphabetic';
+
+  ctx.restore();
+}
+

@@ -1,9 +1,9 @@
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision';
-import type { InputSource } from '../input/InputSource';
-import { computeBodyCenterY } from './bodyMetrics';
+import type { DodgeInputSource, LeanDirection } from '../input/InputSource';
+import { computeBodyCenter } from './bodyMetrics';
 
-// Fractions of normalized frame height. Image-space Y increases downward,
-// so "moved up" means bodyY decreased relative to baseline.
+// Fractions of normalized frame height/width. Image-space Y increases
+// downward, so "moved up" means bodyY decreased relative to baseline.
 const DEFAULT_JUMP_DELTA = 0.07;
 const DEFAULT_DUCK_DELTA = 0.06;
 
@@ -35,13 +35,20 @@ const JUMP_COOLDOWN_MS = 600;
 const DUCK_RELEASE_COOLDOWN_MS = 400;
 const DUCK_RELEASE_JUMP_MULTIPLIER = 1.6;
 
-export class PoseInput implements InputSource {
+// Lean (Weekly Dodge mode) — same smoothing/debounce approach as duck.
+const DEFAULT_LEAN_DELTA = 0.06; // fraction of normalized frame width
+const LEAN_CONFIRM_MS = 150;
+
+export class PoseInput implements DodgeInputSource {
   private baselineY: number | null = null;
+  private baselineX: number | null = null;
   private smoothedY: number | null = null;
+  private smoothedX: number | null = null;
   private latestBodyY: number | null = null;
 
   private readonly jumpDelta: number;
   private readonly duckDelta: number;
+  private readonly leanDelta: number;
 
   // Duck: debounced level-trigger
   private duckHeld = false;
@@ -56,13 +63,23 @@ export class PoseInput implements InputSource {
   private jumpQueued = false;
   private lastJumpQueuedAtMs: number | null = null;
 
-  constructor(jumpDelta: number = DEFAULT_JUMP_DELTA, duckDelta: number = DEFAULT_DUCK_DELTA) {
+  // Lean: debounced level-trigger, mirrors duck's pattern
+  private lean: LeanDirection = 'center';
+  private leanCandidate: LeanDirection = 'center';
+  private leanCandidateSinceMs: number | null = null;
+
+  constructor(jumpDelta: number = DEFAULT_JUMP_DELTA, duckDelta: number = DEFAULT_DUCK_DELTA, leanDelta: number = DEFAULT_LEAN_DELTA) {
     this.jumpDelta = jumpDelta;
     this.duckDelta = duckDelta;
+    this.leanDelta = leanDelta;
   }
 
   setBaseline(y: number): void {
     this.baselineY = y;
+  }
+
+  setBaselineX(x: number): void {
+    this.baselineX = x;
   }
 
   get hasBaseline(): boolean {
@@ -75,16 +92,21 @@ export class PoseInput implements InputSource {
 
   /** Feed the latest detected landmarks for the tracked person (call once per pose frame). */
   updateFromLandmarks(landmarks: NormalizedLandmark[], timestampMs: number): void {
-    const bodyY = computeBodyCenterY(landmarks);
-    if (bodyY === null) return; // low-confidence frame — skip rather than act on noise
-    this.latestBodyY = bodyY;
-    this.smoothedY = this.smoothedY === null ? bodyY : this.smoothedY * SMOOTHING_ALPHA + bodyY * (1 - SMOOTHING_ALPHA);
+    const center = computeBodyCenter(landmarks);
+    if (center === null) return; // low-confidence frame — skip rather than act on noise
+    this.latestBodyY = center.y;
+    this.smoothedY = this.smoothedY === null ? center.y : this.smoothedY * SMOOTHING_ALPHA + center.y * (1 - SMOOTHING_ALPHA);
+    this.smoothedX = this.smoothedX === null ? center.x : this.smoothedX * SMOOTHING_ALPHA + center.x * (1 - SMOOTHING_ALPHA);
 
-    if (this.baselineY === null) return;
-    this.updatePoseState(this.smoothedY, timestampMs);
+    if (this.baselineY !== null) {
+      this.updateJumpDuckState(this.smoothedY, timestampMs);
+    }
+    if (this.baselineX !== null) {
+      this.updateLeanState(this.smoothedX, timestampMs);
+    }
   }
 
-  private updatePoseState(y: number, timestampMs: number): void {
+  private updateJumpDuckState(y: number, timestampMs: number): void {
     const baseline = this.baselineY!;
     const rawDuckCandidate = y - baseline > this.duckDelta;
 
@@ -133,6 +155,25 @@ export class PoseInput implements InputSource {
     }
   }
 
+  private updateLeanState(x: number, timestampMs: number): void {
+    const baseline = this.baselineX!;
+    const delta = x - baseline;
+    // Note: image-space X is mirrored for a selfie view, so a positive
+    // delta (body appears to move right on screen) corresponds to the
+    // player physically leaning to their own right — matches the mirrored
+    // video preview shown during calibration, so it feels intuitive.
+    const rawCandidate: LeanDirection = delta > this.leanDelta ? 'right' : delta < -this.leanDelta ? 'left' : 'center';
+
+    if (rawCandidate !== this.leanCandidate) {
+      this.leanCandidate = rawCandidate;
+      this.leanCandidateSinceMs = timestampMs;
+    }
+    const elapsed = this.leanCandidateSinceMs === null ? 0 : timestampMs - this.leanCandidateSinceMs;
+    if (elapsed >= LEAN_CONFIRM_MS) {
+      this.lean = this.leanCandidate;
+    }
+  }
+
   isJumpPressed(): boolean {
     if (this.jumpQueued) {
       this.jumpQueued = false;
@@ -143,5 +184,10 @@ export class PoseInput implements InputSource {
 
   isDuckHeld(): boolean {
     return this.duckHeld;
+  }
+
+  /** Current lean direction (level-triggered, debounced) — used by the Weekly Dodge mode. */
+  getLean(): LeanDirection {
+    return this.lean;
   }
 }

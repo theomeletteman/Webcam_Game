@@ -2,7 +2,7 @@ import { GameCanvas } from './Canvas';
 import { GameLoop } from './GameLoop';
 import { Player } from '../entities/Player';
 import { KeyboardInput } from '../input/KeyboardInput';
-import type { InputSource } from '../input/InputSource';
+import type { DodgeInputSource } from '../input/InputSource';
 import { ObstacleSpawner } from './ObstacleSpawner';
 import { LevelManager } from './LevelManager';
 import { GROUND_MARGIN, PLAYER_X } from './constants';
@@ -10,10 +10,27 @@ import { WebcamStream } from '../pose/WebcamStream';
 import { PoseDetector } from '../pose/PoseDetector';
 import { PoseCalibrator } from '../pose/PoseCalibrator';
 import { PoseInput } from '../pose/PoseInput';
-import { computeBodyCenterY } from '../pose/bodyMetrics';
+import { computeBodyCenter } from '../pose/bodyMetrics';
 import { countRaisedHands } from '../pose/handGesture';
-import { drawSky, drawSkyline, drawGround, drawPlayer, drawObstacle, drawOfficeBuilding, OFFICE_WIDTH, drawTrophyIcon, drawWarningIcon } from '../render/draw';
+import {
+  drawSky,
+  drawSkyline,
+  drawGround,
+  drawPlayer,
+  drawObstacle,
+  drawOfficeBuilding,
+  drawHomeBuilding,
+  drawDodgeCharacter,
+  drawIncomingItem,
+  OFFICE_WIDTH,
+  HOME_WIDTH,
+  drawTrophyIcon,
+  drawWarningIcon,
+  drawDodgeIcon,
+} from '../render/draw';
+import type { DodgePose } from '../render/sprites';
 import type { PlayerAvatar } from '../entities/Player';
+import { DodgeItem, DODGE_ITEM_LABELS, type DodgeLane } from '../entities/DodgeItem';
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision';
 
 const COUNTDOWN_STAGES = ['Ready', 'Set', 'Go!'];
@@ -24,11 +41,18 @@ const HIT_FLASH_DURATION = 0.2;
 
 const SCORE_PER_CLEAR = 1;
 const SCORE_PENALTY_PER_COLLISION = 1;
-const LEVEL_SCORE_TARGET = 10;
+const LEVEL_SCORE_TARGET = 10; // Score mode: net points needed to clear each level
 const HAND_GESTURE_CONFIRM_MS = 350;
-const MENU_BACKGROUND_SCROLL_SPEED = 90; // keeps selection-screen backdrops alive // Score mode: net points needed to clear each level
+const MENU_BACKGROUND_SCROLL_SPEED = 90; // keeps selection-screen backdrops alive
 
-type GameMode = 'score' | 'retry';
+// Weekly Dodge mode
+const DODGE_TARGET = 10; // successful dodges needed to reach home
+const DODGE_SPAWN_INTERVAL = 1.3; // seconds between incoming items
+const DODGE_DURATION_BASE = 2.4; // seconds for an item to travel from spawn to arrival
+const DODGE_DURATION_MIN = 1.3;
+const DODGE_DURATION_RAMP = 0.09; // duration shrinks slightly per successful dodge — gentle difficulty ramp
+
+type GameMode = 'score' | 'retry' | 'dodge';
 type Phase =
   | 'loadingPose'
   | 'calibrating'
@@ -95,6 +119,12 @@ export class Game {
   private finishBuildingX: number | null = null;
   private pendingFinishCelebration: { message: string; leadsToSetComplete: boolean } | null = null;
 
+  // Weekly Dodge mode
+  private dodgeItems: DodgeItem[] = [];
+  private dodgeSpawnTimer = DODGE_SPAWN_INTERVAL;
+  private dodgedCount = 0;
+  private reachedHome = false;
+
   constructor(container: HTMLElement) {
     this.canvas = new GameCanvas(container);
     this.keyboardInput = new KeyboardInput();
@@ -149,12 +179,13 @@ export class Game {
     if (!landmarks) return;
 
     if (this.phase === 'calibrating' && this.calibrator && !this.calibrator.isComplete) {
-      const bodyY = computeBodyCenterY(landmarks);
-      if (bodyY === null) return;
+      const center = computeBodyCenter(landmarks);
+      if (center === null) return;
 
-      this.calibrator.addSample(bodyY, timestampMs);
-      if (this.calibrator.isComplete && this.calibrator.baseline !== null && this.poseInput) {
+      this.calibrator.addSample(center.x, center.y, timestampMs);
+      if (this.calibrator.isComplete && this.calibrator.baseline !== null && this.calibrator.baselineX !== null && this.poseInput) {
         this.poseInput.setBaseline(this.calibrator.baseline);
+        this.poseInput.setBaselineX(this.calibrator.baselineX);
         this.inputMode = 'pose';
         this.setupMessage = 'Raise one hand for the male dog, both hands for the female dog';
         this.phase = 'avatarSelect';
@@ -179,6 +210,11 @@ export class Game {
           if (count === 1) this.selectMode('score');
           else if (count === 2) this.selectMode('retry');
         });
+        // Third option uses jump — a distinct signal type, not another hand
+        // count, so there's no ambiguity with the two hand-raise options.
+        if (this.poseInput.isJumpPressed()) {
+          this.selectMode('dodge');
+        }
       }
     }
   }
@@ -202,7 +238,7 @@ export class Game {
     onConfirmed(raisedCount);
   }
 
-  private get activeInput(): InputSource {
+  private get activeInput(): DodgeInputSource {
     return this.inputMode === 'pose' && this.poseInput ? this.poseInput : this.keyboardInput;
   }
 
@@ -213,12 +249,13 @@ export class Game {
   private readonly handleModeSelectKey = (event: KeyboardEvent): void => {
     const isOne = event.code === 'Digit1' || event.code === 'Numpad1';
     const isTwo = event.code === 'Digit2' || event.code === 'Numpad2';
-    if (!isOne && !isTwo) return;
+    const isThree = event.code === 'Digit3' || event.code === 'Numpad3';
+    if (!isOne && !isTwo && !isThree) return;
 
     if (this.phase === 'avatarSelect') {
-      this.selectAvatar(isOne ? 'male' : 'female');
+      if (isOne || isTwo) this.selectAvatar(isOne ? 'male' : 'female');
     } else if (this.phase === 'modeSelect') {
-      this.selectMode(isOne ? 'score' : 'retry');
+      this.selectMode(isOne ? 'score' : isTwo ? 'retry' : 'dodge');
     }
   };
 
@@ -230,14 +267,21 @@ export class Game {
     this.handRaiseCandidateSinceMs = null;
     this.setupMessage =
       this.inputMode === 'pose'
-        ? 'Raise one hand for Score mode, both hands for Game Over mode'
+        ? 'Raise 1 hand: Score · Raise 2 hands: Game Over · Jump: Weekly Dodge'
         : '';
     this.phase = 'modeSelect';
   }
 
   private selectMode(mode: GameMode): void {
     this.mode = mode;
-    this.spawner.reset(this.levelManager.config.minGapPx);
+    if (mode === 'dodge') {
+      this.dodgeItems = [];
+      this.dodgeSpawnTimer = DODGE_SPAWN_INTERVAL;
+      this.dodgedCount = 0;
+      this.reachedHome = false;
+    } else {
+      this.spawner.reset(this.levelManager.config.minGapPx);
+    }
     this.beginCountdown();
   }
 
@@ -314,8 +358,10 @@ export class Game {
 
     if (this.mode === 'score') {
       this.updateScoreMode(dt);
-    } else {
+    } else if (this.mode === 'retry') {
       this.updateRetryMode(dt);
+    } else {
+      this.updateDodgeMode(dt);
     }
   }
 
@@ -386,6 +432,57 @@ export class Game {
     }
   }
 
+  private updateDodgeMode(dt: number): void {
+    this.worldDistance += 40 * dt; // slow idle ground motion, purely atmospheric
+
+    this.dodgeSpawnTimer -= dt;
+    if (this.dodgeSpawnTimer <= 0) {
+      const lanes: DodgeLane[] = ['left', 'center', 'right'];
+      const lane = lanes[Math.floor(Math.random() * lanes.length)];
+      const label = DODGE_ITEM_LABELS[Math.floor(Math.random() * DODGE_ITEM_LABELS.length)];
+      this.dodgeItems.push(new DodgeItem(lane, label));
+      this.dodgeSpawnTimer = DODGE_SPAWN_INTERVAL;
+    }
+
+    const duration = Math.max(DODGE_DURATION_MIN, DODGE_DURATION_BASE - this.dodgedCount * DODGE_DURATION_RAMP);
+    const lean = this.activeInput.getLean();
+    const ducking = this.activeInput.isDuckHeld();
+
+    for (const item of this.dodgeItems) {
+      if (item.resolved !== 'pending') {
+        item.update(dt, duration);
+        continue;
+      }
+      item.update(dt, duration);
+      if (!item.hasArrived) continue;
+
+      // Item coming from the left is dodged by leaning right (moving out
+      // of its path), and vice versa — mirrors real-world dodging.
+      const dodged =
+        (item.lane === 'left' && lean === 'right') ||
+        (item.lane === 'right' && lean === 'left') ||
+        (item.lane === 'center' && ducking);
+
+      item.resolved = dodged ? 'dodged' : 'hit';
+      if (dodged) {
+        this.dodgedCount++;
+      } else {
+        this.hitFlashTimer = HIT_FLASH_DURATION;
+      }
+    }
+
+    this.dodgeItems = this.dodgeItems.filter((item) => !item.isExpired);
+
+    if (this.dodgedCount >= DODGE_TARGET && !this.reachedHome) {
+      this.reachedHome = true;
+      this.pendingTransition = {
+        kind: 'celebration',
+        message: 'We made it through the week! 🎉',
+        leadsToSetComplete: true,
+      };
+    }
+  }
+
   private updateCelebration(dt: number): void {
     this.celebrationTimer -= dt;
     if (this.celebrationTimer > 0) return;
@@ -449,6 +546,12 @@ export class Game {
 
     const groundY = this.groundY();
 
+    if (this.mode === 'dodge') {
+      this.renderDodgeScene(ctx, groundY);
+      this.renderHud(ctx);
+      return;
+    }
+
     drawSky(ctx, this.canvas.width, this.canvas.height);
     drawSkyline(ctx, this.canvas.width, groundY, this.worldDistance);
     drawGround(ctx, this.canvas.width, groundY, this.worldDistance);
@@ -475,6 +578,48 @@ export class Game {
     );
 
     this.renderHud(ctx);
+  }
+
+  private renderDodgeScene(ctx: CanvasRenderingContext2D, groundY: number): void {
+    drawSky(ctx, this.canvas.width, this.canvas.height);
+    drawGround(ctx, this.canvas.width, groundY, this.worldDistance);
+
+    const centerX = this.canvas.width / 2;
+
+    if (this.reachedHome) {
+      drawHomeBuilding(ctx, centerX - HOME_WIDTH / 2, groundY);
+    }
+
+    const laneOffsetPx = Math.min(110, this.canvas.width * 0.22);
+    const vanishX = centerX;
+    const vanishY = groundY - 230;
+    const arriveY = groundY - 90;
+
+    for (const item of this.dodgeItems) {
+      const t = Math.min(1.15, item.progress);
+      const laneTargetX = item.lane === 'left' ? centerX - laneOffsetPx : item.lane === 'right' ? centerX + laneOffsetPx : centerX;
+      const x = vanishX + (laneTargetX - vanishX) * t;
+      const y = vanishY + (arriveY - vanishY) * t;
+      drawIncomingItem(ctx, x, y, Math.min(1, t), item.label);
+    }
+
+    const lean = this.activeInput.getLean();
+    const ducking = this.activeInput.isDuckHeld();
+    const pose: DodgePose = ducking ? 'duck' : lean === 'left' ? 'dodgeLeft' : lean === 'right' ? 'dodgeRight' : 'stand';
+    const charWidth = 110;
+    const charHeight = 165;
+
+    drawDodgeCharacter(
+      ctx,
+      centerX - charWidth / 2,
+      groundY - charHeight,
+      charWidth,
+      charHeight,
+      pose,
+      this.player.avatar,
+      this.worldDistance,
+      this.hitFlashTimer > 0 ? '#f38ba8' : null,
+    );
   }
 
   private renderLoadingPose(ctx: CanvasRenderingContext2D): void {
@@ -603,51 +748,56 @@ export class Game {
 
     ctx.textAlign = 'center';
     ctx.fillStyle = '#f5f5f5';
-    ctx.font = 'bold 26px sans-serif';
-    ctx.fillText('Choose a game mode', this.canvas.width / 2, 40);
+    ctx.font = 'bold 24px sans-serif';
+    ctx.fillText('Choose a game mode', this.canvas.width / 2, 36);
 
-    const cardW = Math.min(280, this.canvas.width / 2 - 24);
-    const cardH = 130;
-    const leftX = this.canvas.width / 2 - cardW - 10;
-    const rightX = this.canvas.width / 2 + 10;
-    const cardTop = 60;
+    const gap = 12;
+    const cardW = Math.min(210, (this.canvas.width - 4 * gap) / 3);
+    const cardH = 138;
+    const totalWidth = cardW * 3 + gap * 2;
+    const startX = this.canvas.width / 2 - totalWidth / 2;
+    const cardTop = 54;
+    const colX = [startX, startX + cardW + gap, startX + 2 * (cardW + gap)];
 
-    const leftPanelY = this.drawPanel(ctx, leftX, cardTop, cardW, cardH, '#89b4fa', 0);
-    const rightPanelY = this.drawPanel(ctx, rightX, cardTop, cardW, cardH, '#f38ba8', Math.PI);
+    const panelY0 = this.drawPanel(ctx, colX[0], cardTop, cardW, cardH, '#89b4fa', 0);
+    const panelY1 = this.drawPanel(ctx, colX[1], cardTop, cardW, cardH, '#f38ba8', Math.PI * 0.66);
+    const panelY2 = this.drawPanel(ctx, colX[2], cardTop, cardW, cardH, '#a6e3a1', Math.PI * 1.33);
 
-    drawTrophyIcon(ctx, leftX + 34, leftPanelY + 40, 32);
-    drawWarningIcon(ctx, rightX + 34, rightPanelY + 40, 32);
+    drawTrophyIcon(ctx, colX[0] + 28, panelY0 + 36, 28);
+    drawWarningIcon(ctx, colX[1] + 28, panelY1 + 36, 28);
+    drawDodgeIcon(ctx, colX[2] + 28, panelY2 + 36, 28);
 
     ctx.textAlign = 'left';
-    ctx.font = 'bold 16px sans-serif';
+    ctx.font = 'bold 14px sans-serif';
     ctx.fillStyle = '#89b4fa';
-    ctx.fillText(this.inputMode === 'pose' ? '[Raise 1 hand]' : '[1]', leftX + 58, leftPanelY + 30);
-    ctx.fillText('Score mode', leftX + 58, leftPanelY + 50);
-    ctx.font = '13px sans-serif';
+    ctx.fillText(this.inputMode === 'pose' ? '[1 hand]' : '[1]', colX[0] + 48, panelY0 + 26);
+    ctx.fillText('Score', colX[0] + 48, panelY0 + 44);
+    ctx.font = '11px sans-serif';
     ctx.fillStyle = '#cdd6f4';
     this.wrapText(
       ctx,
-      `Reach ${LEVEL_SCORE_TARGET} points to clear each level (+${SCORE_PER_CLEAR} clear, -${SCORE_PENALTY_PER_COLLISION} hit)`,
-      leftX + 14,
-      leftPanelY + 74,
-      cardW - 28,
-      16,
+      `Reach ${LEVEL_SCORE_TARGET} pts/level (+${SCORE_PER_CLEAR} clear, -${SCORE_PENALTY_PER_COLLISION} hit)`,
+      colX[0] + 12,
+      panelY0 + 66,
+      cardW - 24,
+      14,
     );
 
-    ctx.font = 'bold 16px sans-serif';
+    ctx.font = 'bold 14px sans-serif';
     ctx.fillStyle = '#f38ba8';
-    ctx.fillText(this.inputMode === 'pose' ? '[Raise 2 hands]' : '[2]', rightX + 58, rightPanelY + 30);
-    ctx.fillText('Game Over mode', rightX + 58, rightPanelY + 50);
-    ctx.font = '13px sans-serif';
+    ctx.fillText(this.inputMode === 'pose' ? '[2 hands]' : '[2]', colX[1] + 48, panelY1 + 26);
+    ctx.fillText('Game Over', colX[1] + 48, panelY1 + 44);
+    ctx.font = '11px sans-serif';
     ctx.fillStyle = '#cdd6f4';
-    this.wrapText(
-      ctx,
-      'Clear every obstacle — a single hit means redoing the level from scratch',
-      rightX + 14,
-      rightPanelY + 74,
-      cardW - 28,
-      16,
-    );
+    this.wrapText(ctx, 'Any hit means redoing the level from scratch', colX[1] + 12, panelY1 + 66, cardW - 24, 14);
+
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillStyle = '#a6e3a1';
+    ctx.fillText(this.inputMode === 'pose' ? '[Jump]' : '[3]', colX[2] + 48, panelY2 + 26);
+    ctx.fillText('Weekly Dodge', colX[2] + 48, panelY2 + 44);
+    ctx.font = '11px sans-serif';
+    ctx.fillStyle = '#cdd6f4';
+    this.wrapText(ctx, `Lean or duck to dodge ${DODGE_TARGET} things, then head home`, colX[2] + 12, panelY2 + 66, cardW - 24, 14);
 
     const idleDogY = groundY - 46;
     ctx.textAlign = 'center';
@@ -681,7 +831,10 @@ export class Game {
     ctx.fillStyle = '#f5f5f5';
     ctx.font = '16px sans-serif';
 
-    if (!this.levelManager.isSetComplete) {
+    if (this.mode === 'dodge') {
+      ctx.textAlign = 'left';
+      ctx.fillText(`Dodged: ${Math.min(this.dodgedCount, DODGE_TARGET)}/${DODGE_TARGET}`, 16, 28);
+    } else if (!this.levelManager.isSetComplete) {
       ctx.textAlign = 'left';
       if (this.mode === 'score') {
         ctx.fillText(`Level ${this.levelManager.levelNumber} — Score: ${this.levelScore}/${LEVEL_SCORE_TARGET}`, 16, 28);

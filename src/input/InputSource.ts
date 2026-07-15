@@ -1,3 +1,5 @@
+export type LeanDirection = 'left' | 'center' | 'right';
+
 /**
  * Abstraction over "how the player expresses jump/duck intent."
  *
@@ -14,4 +16,9 @@ export interface InputSource {
 
   /** True for as long as duck is being held/sustained (level-triggered). */
   isDuckHeld(): boolean;
+}
+
+/** Extended input contract for the Weekly Dodge mode — adds lean left/right. */
+export interface DodgeInputSource extends InputSource {
+  getLean(): LeanDirection;
 }
